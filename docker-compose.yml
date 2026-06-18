@@ -1,0 +1,20 @@
+services:
+  crw-shield:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3002:3002"
+    environment:
+      - RUST_LOG=info
+      - HOST=0.0.0.0
+      - PORT=3002
+      # SEARXNG_URL=http://host.docker.internal:8080
+      # SEARXNG_TOKEN=
+      # AUTH_TOKEN=
+      # STEALTH_ENABLED=true
+      # BEHAVIORAL_SIMULATION=true
+      # SCRAPE_DELAY_PRESET=polite
+      # CRAWL_MAX_CONCURRENCY=5
+      # PROXY_URL=
+    restart: unless-stopped
