@@ -4,27 +4,35 @@
 use scraper::{element_ref::ElementRef, Html, Selector};
 
 const UNWANTED_TAGS: &[&str] = &[
-    "script", "style", "noscript", "iframe", "svg", "link", "meta", "nav", "header", "footer",
-    "aside", "form", "button", "input", "select", "textarea", "object", "embed", "applet", "audio",
-    "video", "source", "track", "canvas", "template", "slot",
+    "script", "style", "noscript", "iframe", "svg", "link", "meta", "title", "head", "nav",
+    "header", "footer", "aside", "form", "button", "input", "select", "textarea", "object",
+    "embed", "applet", "audio", "video", "source", "track", "canvas", "template", "slot",
 ];
 
 const CONTENT_SELECTORS: &[&str] = &[
     "main",
     "article",
     "[role=\"main\"]",
+    "[role=\"article\"]",
     "#content",
     "#main",
     "#main-content",
     "#article",
+    "#article-body",
+    "#story",
+    "#story-body",
     ".content",
     ".main",
     ".main-content",
     ".article",
+    ".article-body",
+    ".article-content",
     ".post",
     ".post-content",
     ".entry-content",
     ".page-content",
+    ".story",
+    ".story-body",
     "[itemprop=\"articleBody\"]",
 ];
 
@@ -44,38 +52,56 @@ pub fn strip_unwanted(html: &str) -> String {
 fn is_hidden(el: &ElementRef<'_>) -> bool {
     if let Some(class) = el.value().attr("class") {
         let lc = class.to_ascii_lowercase();
-        if lc.contains("hidden")
-            || lc.contains("display-none")
-            || lc.contains("d-none")
-            || lc.contains("invisible")
-            || lc.contains("visually-hidden")
-            || lc.contains("sr-only")
-            || lc.contains("offscreen")
-            || lc.contains("screen-reader")
-        {
+        let mut tokens = lc.split_whitespace();
+        let hidden_markers = [
+            "hidden",
+            "display-none",
+            "d-none",
+            "invisible",
+            "visually-hidden",
+            "sr-only",
+            "offscreen",
+            "screen-reader",
+            "collapse",
+            "collapsed",
+            "is-hidden",
+            "js-hidden",
+            "no-display",
+            "no-print",
+        ];
+        if tokens.any(|t| hidden_markers.contains(&t)) {
             return true;
         }
     }
     if el
         .value()
         .attr("aria-hidden")
-        .map(|v| v == "true")
+        .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
         return true;
     }
     if let Some(style) = el.value().attr("style") {
         let s = style.to_ascii_lowercase();
-        if s.contains("display:none")
-            || s.contains("display: none")
-            || s.contains("display:none;")
-            || s.contains("visibility:hidden")
-            || s.contains("visibility: hidden")
+        let compact: String = s.split_whitespace().collect::<Vec<_>>().join("");
+        if compact.contains("display:none")
+            || compact.contains("display:none;")
+            || compact.contains("visibility:hidden")
+            || compact.contains("visibility:hidden;")
+            || compact.contains("visibility:collapse")
         {
             return true;
         }
     }
     if el.value().attr("hidden").is_some() {
+        return true;
+    }
+    if el
+        .value()
+        .attr("data-state")
+        .map(|v| v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapsed"))
+        .unwrap_or(false)
+    {
         return true;
     }
     false
@@ -88,7 +114,13 @@ fn walk_and_serialise<'a>(
 ) {
     if let Some(el) = ElementRef::wrap(node) {
         let tag = el.value().name();
-        let is_tag_unwanted = UNWANTED_TAGS.contains(&tag) || is_hidden(&el);
+        let is_data_uri_img = tag == "img"
+            && el
+                .value()
+                .attr("src")
+                .is_some_and(|s| s.starts_with("data:image/"));
+        let is_tag_unwanted =
+            UNWANTED_TAGS.contains(&tag) || is_hidden(&el) || is_data_uri_img;
         ancestor_unwanted.push(is_tag_unwanted);
         if !is_tag_unwanted {
             serialise_open(el, out);
@@ -173,8 +205,8 @@ pub fn extract_main_content(html: &str) -> String {
         }
     }
 
-    if let Some(div) = largest_text_div(&doc) {
-        return div.inner_html();
+    if let Some(block) = largest_text_block(&doc) {
+        return block.inner_html();
     }
 
     if let Ok(body_sel) = Selector::parse("body") {
@@ -190,15 +222,53 @@ fn text_length(el: ElementRef<'_>) -> usize {
     el.text().collect::<String>().len()
 }
 
-fn largest_text_div(doc: &Html) -> Option<ElementRef<'_>> {
-    let sel = Selector::parse("div, section").ok()?;
+fn largest_text_block(doc: &Html) -> Option<ElementRef<'_>> {
+    const MIN_LEN: usize = 100;
+    const DENSITY_MIN_LEN: usize = 200;
+
+    let body_sel = Selector::parse("body").ok()?;
+    let block_sel = Selector::parse("div, section").ok()?;
+
+    let body = doc.select(&body_sel).next()?;
+
+    let mut best_density: Option<(f64, ElementRef<'_>)> = None;
+    for el in body.select(&block_sel) {
+        let text_len = text_length(el);
+        if text_len > DENSITY_MIN_LEN {
+            let html_len = el.inner_html().len();
+            if html_len > 0 {
+                let density = text_len as f64 / html_len as f64;
+                if best_density.as_ref().is_none_or(|(b, _)| density > *b) {
+                    best_density = Some((density, el));
+                }
+            }
+        }
+    }
+
+    if let Some((_, el)) = best_density {
+        return Some(el);
+    }
+
     let mut best: Option<(usize, ElementRef<'_>)> = None;
-    for el in doc.select(&sel) {
+    for el in body.select(&block_sel) {
         let len = text_length(el);
-        if best.as_ref().is_none_or(|(b, _)| len > *b) && len > 100 {
+        if len >= MIN_LEN && best.as_ref().is_none_or(|(b, _)| len > *b) {
             best = Some((len, el));
         }
     }
+
+    if best.is_none() {
+        let p_sel = Selector::parse("p").ok()?;
+        let mut best_p: Option<(usize, ElementRef<'_>)> = None;
+        for el in doc.select(&p_sel) {
+            let len = text_length(el);
+            if len >= MIN_LEN && best_p.as_ref().is_none_or(|(b, _)| len > *b) {
+                best_p = Some((len, el));
+            }
+        }
+        best = best_p;
+    }
+
     best.map(|(_, el)| el)
 }
 
@@ -389,5 +459,112 @@ mod tests {
     fn filter_tags_no_filters_returns_original() {
         let html = "<p>x</p>";
         assert_eq!(filter_tags(html, &[], &[]), html);
+    }
+
+    #[test]
+    fn strip_unwanted_removes_head_element() {
+        let html = r#"<html><head><title>Title</title><style>body{}</style></head><body><p>hi</p></body></html>"#;
+        let out = strip_unwanted(html);
+        assert!(!out.contains("<head"));
+        assert!(!out.contains("<title"));
+        assert!(!out.contains("<style"));
+        assert!(out.contains("hi"));
+    }
+
+    #[test]
+    fn strip_unwanted_removes_header_and_aside() {
+        let html = r#"<div><header>head</header><aside>side</aside><p>body</p></div>"#;
+        let out = strip_unwanted(html);
+        assert!(!out.contains("<header"));
+        assert!(!out.contains("<aside"));
+        assert!(out.contains("<p>body</p>"));
+    }
+
+    #[test]
+    fn strip_unwanted_removes_noscript_and_svg_with_text() {
+        let html =
+            r#"<div><noscript>Enable JS</noscript><svg><text>SVG text</text></svg><p>ok</p></div>"#;
+        let out = strip_unwanted(html);
+        assert!(!out.contains("<noscript"));
+        assert!(!out.contains("<svg"));
+        assert!(!out.contains("Enable JS"));
+        assert!(!out.contains("SVG text"));
+        assert!(out.contains("<p>ok</p>"));
+    }
+
+    #[test]
+    fn strip_unwanted_detects_hidden_class() {
+        let html =
+            r#"<div><p class="hidden">x</p><p class="d-none">y</p><p class="show">z</p></div>"#;
+        let out = strip_unwanted(html);
+        assert!(!out.contains(">x<"));
+        assert!(!out.contains(">y<"));
+        assert!(out.contains("z"));
+    }
+
+    #[test]
+    fn strip_unwanted_detects_visibility_collapse() {
+        let html = r#"<div><p style="visibility: collapse">gone</p><p>here</p></div>"#;
+        let out = strip_unwanted(html);
+        assert!(!out.contains("gone"));
+        assert!(out.contains("here"));
+    }
+
+    #[test]
+    fn strip_unwanted_detects_display_none_with_spaces() {
+        let html = r#"<div><p style="display:  none  !important">x</p><p>y</p></div>"#;
+        let out = strip_unwanted(html);
+        assert!(!out.contains(">x<"));
+        assert!(out.contains(">y<"));
+    }
+
+    #[test]
+    fn extract_main_content_uses_role_main() {
+        let html = r#"<html><body><div role="main"><p>role-main body</p></div></body></html>"#;
+        let main = extract_main_content(html);
+        assert!(main.contains("role-main body"));
+    }
+
+    #[test]
+    fn extract_main_content_uses_id_content() {
+        let html = r#"<html><body><div id="content"><p>id-content body</p></div></body></html>"#;
+        let main = extract_main_content(html);
+        assert!(main.contains("id-content body"));
+    }
+
+    #[test]
+    fn extract_main_content_uses_class_content() {
+        let html =
+            r#"<html><body><div class="content"><p>class-content body</p></div></body></html>"#;
+        let main = extract_main_content(html);
+        assert!(main.contains("class-content body"));
+    }
+
+    #[test]
+    fn extract_main_content_falls_back_to_largest_div() {
+        let long = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(10);
+        let html = format!(
+            r#"<html><body><div class="sidebar"><p>short</p></div><div class="article"><p>{long}</p></div></body></html>"#
+        );
+        let main = extract_main_content(&html);
+        assert!(main.contains(&long));
+    }
+
+    #[test]
+    fn extract_main_content_strips_inline_styles_in_kept_section() {
+        let html = r#"<html><body><main><p style="color:red">kept</p></main></body></html>"#;
+        let main = extract_main_content(html);
+        assert!(!main.contains("color:red"));
+        assert!(main.contains("kept"));
+    }
+
+    #[test]
+    fn strip_unwanted_removes_data_uri_images() {
+        let html = r#"<div><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" alt="big" /><p>text</p><img src="https://example.com/real.png" alt="ok" /></div>"#;
+        let out = strip_unwanted(html);
+        assert!(!out.contains("data:image/"), "data URI image should be removed: {out}");
+        assert!(!out.contains("base64"), "base64 content should not appear: {out}");
+        assert!(out.contains("https://example.com/real.png"), "normal img should be kept: {out}");
+        assert!(out.contains("text"));
     }
 }
