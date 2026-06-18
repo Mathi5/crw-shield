@@ -19,6 +19,7 @@ pub struct Config {
     pub proxy_file: Option<String>,
     pub proxy_sticky_sessions: bool,
     pub proxy_cooldown_secs: u64,
+    pub flaresolverr_url: Option<String>,
 }
 
 impl Default for Config {
@@ -40,6 +41,7 @@ impl Default for Config {
             proxy_file: None,
             proxy_sticky_sessions: true,
             proxy_cooldown_secs: 300,
+            flaresolverr_url: None,
         }
     }
 }
@@ -115,6 +117,11 @@ impl Config {
             cfg.proxy_cooldown_secs = v.parse().map_err(|e| {
                 crate::error::CrwError::Config(format!("invalid PROXY_COOLDOWN_SECS: {e}"))
             })?;
+        }
+        if let Ok(v) = env::var("FLARESOLVERR_URL") {
+            if !v.is_empty() {
+                cfg.flaresolverr_url = Some(v);
+            }
         }
 
         Ok(cfg)

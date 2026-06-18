@@ -18,6 +18,7 @@ use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, Scrape
 use tracing::{debug, warn};
 
 use crate::cdp::{CdpFetchResult, CdpFetcher};
+use crate::flaresolverr::FlareSolverrClient;
 use crate::http::{FetchResult, Fetcher, HttpFetcher};
 
 /// Outcome of a ladder attempt — what backend served the response.
@@ -26,6 +27,8 @@ pub enum FetchSource {
     Http,
     Cdp,
     HttpChallengeThenCdp,
+    FlareSolverr,
+    CdpThenFlareSolverr,
 }
 
 impl FetchSource {
@@ -34,6 +37,8 @@ impl FetchSource {
             FetchSource::Http => "http",
             FetchSource::Cdp => "cdp",
             FetchSource::HttpChallengeThenCdp => "http+cdp",
+            FetchSource::FlareSolverr => "flaresolverr",
+            FetchSource::CdpThenFlareSolverr => "cdp+flaresolverr",
         }
     }
 }
@@ -46,15 +51,25 @@ pub struct LadderResult {
     pub source: FetchSource,
 }
 
-/// Composite fetcher that owns an HTTP fetcher plus an optional CDP fetcher.
+/// Composite fetcher that owns an HTTP fetcher plus an optional CDP fetcher
+/// and an optional FlareSolverr escalation step.
 pub struct FetchLadder {
     http: Arc<HttpFetcher>,
     cdp: Option<Arc<CdpFetcher>>,
+    flaresolverr: Option<Arc<FlareSolverrClient>>,
 }
 
 impl FetchLadder {
-    pub fn new(http: Arc<HttpFetcher>, cdp: Option<Arc<CdpFetcher>>) -> Self {
-        Self { http, cdp }
+    pub fn new(
+        http: Arc<HttpFetcher>,
+        cdp: Option<Arc<CdpFetcher>>,
+        flaresolverr: Option<Arc<FlareSolverrClient>>,
+    ) -> Self {
+        Self {
+            http,
+            cdp,
+            flaresolverr,
+        }
     }
 
     /// Heuristic: should we skip HTTP and go straight to CDP?
@@ -101,6 +116,49 @@ impl FetchLadder {
         cdp.fetch_with_screenshot(request).await
     }
 
+    /// Escalate to FlareSolverr to solve a remaining challenge. Returns
+    /// `None` if no FlareSolverr client is configured.
+    async fn try_flaresolverr(
+        &self,
+        url: &str,
+        request: &ScrapeRequest,
+        from_cdp: bool,
+    ) -> Result<Option<LadderResult>> {
+        let Some(fs) = self.flaresolverr.as_ref() else {
+            return Ok(None);
+        };
+        debug!(url = %url, "escalating to FlareSolverr");
+        match fs.fetch(url, 60_000).await {
+            Ok(solution) => {
+                let mut headers = std::collections::HashMap::new();
+                headers.insert("x-crw-source".to_string(), "flaresolverr".to_string());
+                if let Some(ua) = &solution.user_agent {
+                    headers.insert("x-crw-user-agent".to_string(), ua.clone());
+                }
+                let fetch = FetchResult {
+                    url: request.url.clone(),
+                    final_url: solution.final_url,
+                    status_code: solution.status_code,
+                    html: solution.html,
+                    headers,
+                };
+                Ok(Some(LadderResult {
+                    fetch,
+                    screenshot: None,
+                    source: if from_cdp {
+                        FetchSource::CdpThenFlareSolverr
+                    } else {
+                        FetchSource::FlareSolverr
+                    },
+                }))
+            }
+            Err(e) => {
+                warn!(error = %e, url = %url, "FlareSolverr escalation failed");
+                Err(e)
+            }
+        }
+    }
+
     /// Run the full ladder and return the best result.
     pub async fn fetch(&self, request: &ScrapeRequest) -> Result<LadderResult> {
         // Decide whether to even try HTTP.
@@ -121,6 +179,21 @@ impl FetchLadder {
                     if self.cdp.is_some() {
                         match self.try_cdp(request).await {
                             Ok(cdp_res) => {
+                                // If the CDP response STILL looks like a
+                                // challenge and FlareSolverr is configured,
+                                // escalate one more step.
+                                if detect_challenge(&cdp_res.html).is_some() {
+                                    if let Some(fs_result) = self
+                                        .try_flaresolverr(
+                                            &request.url,
+                                            request,
+                                            true,
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(fs_result);
+                                    }
+                                }
                                 return Ok(LadderResult {
                                     fetch: FetchResult {
                                         url: cdp_res.url,
@@ -134,7 +207,13 @@ impl FetchLadder {
                                 });
                             }
                             Err(e) => {
-                                warn!(error=%e, "CDP fallback failed after challenge; returning HTTP result anyway");
+                                warn!(error=%e, "CDP fallback failed after challenge; trying FlareSolverr");
+                                if let Some(fs_result) = self
+                                    .try_flaresolverr(&request.url, request, true)
+                                    .await?
+                                {
+                                    return Ok(fs_result);
+                                }
                                 return Ok(LadderResult {
                                     fetch,
                                     screenshot: None,
@@ -143,8 +222,15 @@ impl FetchLadder {
                             }
                         }
                     }
-                    // No CDP available; return the HTTP result (caller will
-                    // likely surface the challenge as an error).
+                    // No CDP available; try FlareSolverr as a final escalation.
+                    if let Some(fs_result) = self
+                        .try_flaresolverr(&request.url, request, false)
+                        .await?
+                    {
+                        return Ok(fs_result);
+                    }
+                    // No CDP / FlareSolverr available; return the HTTP result
+                    // (caller will likely surface the challenge as an error).
                     return Ok(LadderResult {
                         fetch,
                         screenshot: None,
@@ -155,6 +241,16 @@ impl FetchLadder {
                     debug!(error=%e, "HTTP fetch failed; trying CDP");
                     if self.cdp.is_some() {
                         let cdp_res = self.try_cdp(request).await?;
+                        // Escalate to FlareSolverr if the CDP result is still
+                        // a challenge page.
+                        if detect_challenge(&cdp_res.html).is_some() {
+                            if let Some(fs_result) = self
+                                .try_flaresolverr(&request.url, request, true)
+                                .await?
+                            {
+                                return Ok(fs_result);
+                            }
+                        }
                         return Ok(LadderResult {
                             fetch: FetchResult {
                                 url: cdp_res.url,
@@ -174,6 +270,14 @@ impl FetchLadder {
 
         // Force CDP path.
         let cdp_res = self.try_cdp(request).await?;
+        if detect_challenge(&cdp_res.html).is_some() {
+            if let Some(fs_result) = self
+                .try_flaresolverr(&request.url, request, true)
+                .await?
+            {
+                return Ok(fs_result);
+            }
+        }
         Ok(LadderResult {
             fetch: FetchResult {
                 url: cdp_res.url,
@@ -283,7 +387,7 @@ mod tests {
 
     fn ladder_with_http_only() -> (FetchLadder, Arc<HttpFetcher>) {
         let http = Arc::new(HttpFetcher::new(5_000, false, DelayPreset::Polite).unwrap());
-        let ladder = FetchLadder::new(http.clone(), None);
+        let ladder = FetchLadder::new(http.clone(), None, None);
         (ladder, http)
     }
 
@@ -415,5 +519,25 @@ mod tests {
             .screenshot
             .unwrap()
             .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn fetch_source_as_str_returns_expected_strings() {
+        assert_eq!(FetchSource::Http.as_str(), "http");
+        assert_eq!(FetchSource::Cdp.as_str(), "cdp");
+        assert_eq!(FetchSource::HttpChallengeThenCdp.as_str(), "http+cdp");
+        assert_eq!(FetchSource::FlareSolverr.as_str(), "flaresolverr");
+        assert_eq!(
+            FetchSource::CdpThenFlareSolverr.as_str(),
+            "cdp+flaresolverr"
+        );
+    }
+
+    #[test]
+    fn ladder_construction_accepts_flaresolverr_option() {
+        let http = Arc::new(HttpFetcher::new(5_000, false, DelayPreset::Polite).unwrap());
+        let _ladder_no_fs = FetchLadder::new(http.clone(), None, None);
+        let fs = Arc::new(FlareSolverrClient::new("http://localhost:8191").unwrap());
+        let _ladder_with_fs = FetchLadder::new(http, None, Some(fs));
     }
 }

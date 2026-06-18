@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crw_antibot::DelayPreset;
 use crw_core::Config;
-use crw_fetch::{CdpFetcher, FetchLadder, HttpFetcher};
+use crw_fetch::{CdpFetcher, FetchLadder, FlareSolverrClient, HttpFetcher};
 
 use crate::handlers::CrawlJob;
 
@@ -30,7 +30,17 @@ impl AppState {
         } else {
             None
         };
-        let ladder = Arc::new(FetchLadder::new(http, cdp));
+        let flaresolverr = match config.flaresolverr_url.as_deref() {
+            Some(url) if !url.is_empty() => match FlareSolverrClient::new(url) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    tracing::warn!(error=%e, "failed to build FlareSolverrClient; disabling");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let ladder = Arc::new(FetchLadder::new(http, cdp, flaresolverr));
         Self {
             config: Arc::new(config),
             ladder,
