@@ -1,0 +1,14 @@
+[package]
+name = "crw-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+crw-core = { path = "../core" }
+scraper = { workspace = true }
+ego-tree = "0.10"
+htmd = { workspace = true }
+url = { workspace = true }
+serde_json = { workspace = true }

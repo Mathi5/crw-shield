@@ -1,0 +1,13 @@
+[package]
+name = "crw-map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+crw-core = { path = "../core" }
+crw-extract = { path = "../extract" }
+quick-xml = "0.36"
+url = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "crw-crawl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+crw-core = { path = "../core" }
+url = { workspace = true }
+regex = "1"
