@@ -61,6 +61,24 @@ once_cell = "1"
 # Test
 mockito = "1.5"
 
+# Browser automation (CDP)
+chromiumoxide = { version = "0.9", default-features = false }
+
+# SQLite for the crawl job store
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# In-memory cache
+moka = { version = "0.12", features = ["future"] }
+
+# Futures utilities
+futures = "0.3"
+
+# Sitemap parsing
+quick-xml = "0.36"
+
+# URL/path filtering
+regex = "1"
+
 # Pinned transitive deps to remain compatible with Rust 1.83.
 # Newer versions require edition2024 which is unstable in 1.83.
 time = "<0.3.44"
@@ -80,7 +98,6 @@ indexmap = "2.5"
 zeroize = "<1.9"
 cookie_store = "<0.22"
 hyper-rustls = "0.27"
-quick-xml = "0.36"
 wit-bindgen = "<0.2"
 
 [profile.release]

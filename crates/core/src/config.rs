@@ -130,6 +130,11 @@ fn parse_bool(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Env-var tests must not run concurrently because they mutate process-wide
+    // environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_config_has_expected_values() {
@@ -144,6 +149,7 @@ mod tests {
 
     #[test]
     fn from_env_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PORT", "4321");
         std::env::set_var("AUTH_TOKEN", "secret");
         std::env::set_var("STEALTH_ENABLED", "false");
@@ -166,6 +172,7 @@ mod tests {
 
     #[test]
     fn from_env_invalid_port() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PORT", "not-a-number");
         let err = Config::from_env().unwrap_err();
         match err {

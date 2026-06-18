@@ -11,3 +11,5 @@ crw-extract = { path = "../extract" }
 quick-xml = "0.36"
 url = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }

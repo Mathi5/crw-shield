@@ -17,7 +17,7 @@ async fn health_endpoint_returns_ok() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let url = format!("http://{}/health", addr);
+    let url = format!("http://{addr}/health");
     let resp = reqwest::get(url).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -58,7 +58,7 @@ async fn scrape_endpoint_returns_markdown() {
         .build()
         .unwrap();
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .json(&json!({"url": url}))
         .send()
         .await
@@ -87,7 +87,7 @@ async fn scrape_with_invalid_url_returns_error() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .json(&json!({"url": "not a url"}))
         .send()
         .await
@@ -129,7 +129,7 @@ async fn scrape_with_links_format_extracts_links() {
         .build()
         .unwrap();
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .json(&json!({"url": url, "formats": ["links"]}))
         .send()
         .await
@@ -172,7 +172,7 @@ async fn scrape_detects_cloudflare_challenge() {
         .build()
         .unwrap();
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .json(&json!({"url": url}))
         .send()
         .await
@@ -209,7 +209,7 @@ async fn screenshot_format_returns_not_implemented() {
         .build()
         .unwrap();
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .json(&json!({"url": url, "formats": ["screenshot"]}))
         .send()
         .await
@@ -233,8 +233,10 @@ async fn auth_token_enforced_when_set() {
         .await;
 
     let url = format!("{}/p", server.url());
-    let mut cfg = Config::default();
-    cfg.auth_token = Some("secret-token".to_string());
+    let cfg = Config {
+        auth_token: Some("secret-token".to_string()),
+        ..Config::default()
+    };
     let state = AppState::from_config(cfg);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -250,7 +252,7 @@ async fn auth_token_enforced_when_set() {
 
     // Without token -> 401
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .json(&json!({"url": url}))
         .send()
         .await
@@ -259,7 +261,7 @@ async fn auth_token_enforced_when_set() {
 
     // With bad token -> 401
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .header("Authorization", "Bearer wrong")
         .json(&json!({"url": "http://example.com"}))
         .send()
@@ -270,7 +272,7 @@ async fn auth_token_enforced_when_set() {
     // With valid token + valid url pointing to the mock -> 200 (auth passed
     // and fetch happened)
     let resp = client
-        .post(format!("http://{}/v2/scrape", addr))
+        .post(format!("http://{addr}/v2/scrape"))
         .header("Authorization", "Bearer secret-token")
         .json(&json!({"url": url}))
         .send()
