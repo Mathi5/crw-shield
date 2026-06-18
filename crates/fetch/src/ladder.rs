@@ -78,8 +78,13 @@ impl FetchLadder {
     }
 
     /// Decide whether the HTTP response is a challenge page and should be
-    /// escalated to CDP.
+    /// escalated to CDP. We treat both obvious challenge HTML (Cloudflare,
+    /// hCaptcha, ...) and suspicious anti-bot status codes (403, 429) as
+    /// triggers so we can fall back to a real browser.
     fn http_is_challenge(fetch: &FetchResult) -> bool {
+        if matches!(fetch.status_code, 403 | 429) {
+            return true;
+        }
         detect_challenge(&fetch.html).is_some()
     }
 
@@ -322,6 +327,47 @@ mod tests {
             headers: Default::default(),
         };
         assert!(!FetchLadder::http_is_challenge(&fetch));
+    }
+
+    #[test]
+    fn http_is_challenge_detects_403() {
+        let fetch = FetchResult {
+            url: "https://x".into(),
+            final_url: "https://x".into(),
+            status_code: 403,
+            html: "<html><body>Forbidden</body></html>".into(),
+            headers: Default::default(),
+        };
+        assert!(FetchLadder::http_is_challenge(&fetch));
+    }
+
+    #[test]
+    fn http_is_challenge_detects_429() {
+        let fetch = FetchResult {
+            url: "https://x".into(),
+            final_url: "https://x".into(),
+            status_code: 429,
+            html: "<html><body>Too Many Requests</body></html>".into(),
+            headers: Default::default(),
+        };
+        assert!(FetchLadder::http_is_challenge(&fetch));
+    }
+
+    #[test]
+    fn http_is_challenge_ignores_other_error_codes() {
+        for code in [400u16, 404, 500, 502, 503] {
+            let fetch = FetchResult {
+                url: "https://x".into(),
+                final_url: "https://x".into(),
+                status_code: code,
+                html: "<html><body>err</body></html>".into(),
+                headers: Default::default(),
+            };
+            assert!(
+                !FetchLadder::http_is_challenge(&fetch),
+                "expected code {code} not to be treated as challenge"
+            );
+        }
     }
 
     #[tokio::test]

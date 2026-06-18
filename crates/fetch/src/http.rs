@@ -139,16 +139,21 @@ impl Fetcher for HttpFetcher {
             .await
             .map_err(|e| CrwError::Fetch(e.to_string()))?;
 
-        if !status.is_success() {
+        // 403 (Forbidden) and 429 (Too Many Requests) are commonly returned
+        // by anti-bot services when the request is blocked. Surface them as a
+        // successful fetch with the body intact so the ladder can decide
+        // whether to escalate to CDP instead of bubbling the error up.
+        let status_u16 = status.as_u16();
+        if !status.is_success() && !matches!(status_u16, 403 | 429) {
             return Err(CrwError::Http {
-                status: status.as_u16(),
+                status: status_u16,
                 message: format!("HTTP {status}"),
             });
         }
         Ok(FetchResult {
             url: request.url.clone(),
             final_url,
-            status_code: status.as_u16(),
+            status_code: status_u16,
             html,
             headers: response_headers,
         })
@@ -204,5 +209,78 @@ mod tests {
             CrwError::InvalidUrl(_) => {}
             _ => panic!("expected InvalidUrl, got {err:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fetcher_returns_ok_for_403_with_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/blocked")
+            .with_status(403)
+            .with_header("content-type", "text/html")
+            .with_body("<html><body>nope</body></html>")
+            .create_async()
+            .await;
+
+        let url = format!("{}/blocked", server.url());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let fetcher = HttpFetcher::with_client(client, false, DelayPreset::Polite);
+        let req = ScrapeRequest::default_for_url(url);
+        let res = fetcher.fetch(&req).await.unwrap();
+        assert_eq!(res.status_code, 403);
+        assert!(res.html.contains("nope"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetcher_returns_ok_for_429_with_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/slow")
+            .with_status(429)
+            .with_header("content-type", "text/html")
+            .with_body("<html><body>slow down</body></html>")
+            .create_async()
+            .await;
+
+        let url = format!("{}/slow", server.url());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let fetcher = HttpFetcher::with_client(client, false, DelayPreset::Polite);
+        let req = ScrapeRequest::default_for_url(url);
+        let res = fetcher.fetch(&req).await.unwrap();
+        assert_eq!(res.status_code, 429);
+        assert!(res.html.contains("slow down"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetcher_errors_on_other_non_success_statuses() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/server-error")
+            .with_status(500)
+            .with_body("kaboom")
+            .create_async()
+            .await;
+
+        let url = format!("{}/server-error", server.url());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let fetcher = HttpFetcher::with_client(client, false, DelayPreset::Polite);
+        let req = ScrapeRequest::default_for_url(url);
+        let err = fetcher.fetch(&req).await.unwrap_err();
+        match err {
+            CrwError::Http { status, .. } => assert_eq!(status, 500),
+            other => panic!("expected Http error, got {other:?}"),
+        }
+        mock.assert_async().await;
     }
 }

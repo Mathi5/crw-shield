@@ -13,6 +13,7 @@ pub struct Config {
     pub crawl_default_limit: usize,
     pub scrape_delay_preset: String,
     pub stealth_enabled: bool,
+    pub cdp_enabled: bool,
     pub behavioral_simulation: bool,
     pub proxy_url: Option<String>,
     pub proxy_file: Option<String>,
@@ -33,6 +34,7 @@ impl Default for Config {
             crawl_default_limit: 10_000,
             scrape_delay_preset: "polite".to_string(),
             stealth_enabled: true,
+            cdp_enabled: true,
             behavioral_simulation: true,
             proxy_url: None,
             proxy_file: None,
@@ -89,6 +91,9 @@ impl Config {
         }
         if let Ok(v) = env::var("STEALTH_ENABLED") {
             cfg.stealth_enabled = parse_bool(&v);
+        }
+        if let Ok(v) = env::var("CDP_ENABLED") {
+            cfg.cdp_enabled = parse_bool(&v);
         }
         if let Ok(v) = env::var("BEHAVIORAL_SIMULATION") {
             cfg.behavioral_simulation = parse_bool(&v);

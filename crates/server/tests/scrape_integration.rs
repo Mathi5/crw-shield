@@ -159,7 +159,11 @@ async fn scrape_detects_cloudflare_challenge() {
         .await;
 
     let url = format!("{}/cf", server.url());
-    let state = AppState::from_config(Config::default());
+    let cfg = Config {
+        cdp_enabled: false,
+        ..Config::default()
+    };
+    let state = AppState::from_config(cfg);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -186,17 +190,11 @@ async fn scrape_detects_cloudflare_challenge() {
 
 #[tokio::test]
 async fn screenshot_format_returns_not_implemented() {
-    let mut server = Server::new_async().await;
-    let mock = server
-        .mock("GET", "/p")
-        .with_status(200)
-        .with_header("content-type", "text/html")
-        .with_body("<html><body>x</body></html>")
-        .create_async()
-        .await;
-
-    let url = format!("{}/p", server.url());
-    let state = AppState::from_config(Config::default());
+    let cfg = Config {
+        cdp_enabled: false,
+        ..Config::default()
+    };
+    let state = AppState::from_config(cfg);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -210,7 +208,7 @@ async fn screenshot_format_returns_not_implemented() {
         .unwrap();
     let resp = client
         .post(format!("http://{addr}/v2/scrape"))
-        .json(&json!({"url": url, "formats": ["screenshot"]}))
+        .json(&json!({"url": "http://example.com", "formats": ["screenshot"]}))
         .send()
         .await
         .unwrap();
@@ -218,7 +216,6 @@ async fn screenshot_format_returns_not_implemented() {
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "NOT_IMPLEMENTED");
-    mock.assert_async().await;
 }
 
 #[tokio::test]

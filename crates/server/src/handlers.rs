@@ -4,6 +4,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::Engine;
 use chrono::Utc;
 use crw_antibot::detect_challenge;
 use crw_core::{
@@ -53,18 +54,22 @@ async fn handle_scrape(
 
     info!(url = %url, "scrape request");
 
-    let fetch_result = state
-        .fetcher
+    let ladder_result = state
+        .ladder
         .fetch(&req)
         .await
         .map_err(|e| ErrorResponse::new(e.code(), e.to_string()))?;
 
-    if let Some(challenge) = detect_challenge(&fetch_result.html) {
-        warn!(url = %url, challenge = %challenge, "challenge detected");
-        return Err(ErrorResponse::new(
-            "CHALLENGE_DETECTED",
-            format!("anti-bot challenge detected: {challenge}"),
-        ));
+    let fetch_result = ladder_result.fetch;
+
+    if !state.config.cdp_enabled {
+        if let Some(challenge) = detect_challenge(&fetch_result.html) {
+            warn!(url = %url, challenge = %challenge, "challenge detected");
+            return Err(ErrorResponse::new(
+                "CHALLENGE_DETECTED",
+                format!("anti-bot challenge detected: {challenge}"),
+            ));
+        }
     }
 
     let formats: HashSet<Format> = req.formats.iter().copied().collect();
@@ -106,10 +111,12 @@ async fn handle_scrape(
         None
     };
     let screenshot = if wants(Format::Screenshot) {
-        return Err(ErrorResponse::new(
-            "NOT_IMPLEMENTED",
-            "Screenshot is not available in Phase 1 (CDP required)",
-        ));
+        ladder_result.screenshot.as_ref().map(|bytes| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        })
     } else {
         None
     };
@@ -201,11 +208,11 @@ async fn handle_crawl_start(
     // Spawn the actual crawl so the API responds immediately. The job is
     // mutated in place via the shared `jobs` HashMap.
     let jobs = state.jobs.clone();
-    let fetcher = state.fetcher.clone();
+    let ladder = state.ladder.clone();
     let job_id = id.clone();
     let crawl_req = req.clone();
     tokio::spawn(async move {
-        run_crawl_job(jobs, fetcher, job_id, crawl_req).await;
+        run_crawl_job(jobs, ladder, job_id, crawl_req).await;
     });
 
     Ok(CrawlResponse {
@@ -221,7 +228,7 @@ async fn handle_crawl_start(
 /// `scraping` → `completed` (or `failed`).
 async fn run_crawl_job(
     jobs: Arc<std::sync::Mutex<std::collections::HashMap<String, CrawlJob>>>,
-    fetcher: Arc<crate::state::FetcherType>,
+    ladder: Arc<crate::state::FetchLadderType>,
     job_id: String,
     req: CrawlRequest,
 ) {
@@ -238,7 +245,7 @@ async fn run_crawl_job(
         }
     }
 
-    let runner = Arc::new(FetcherScrapeRunner { fetcher });
+    let runner = Arc::new(FetcherScrapeRunner { fetcher: ladder });
     let result = crw_crawl(runner, &req).await;
 
     let mut guard = jobs.lock().expect("jobs mutex poisoned");
