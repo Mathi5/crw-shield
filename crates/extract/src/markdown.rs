@@ -27,7 +27,6 @@ mod tests {
     #[test]
     fn converts_heading_and_paragraph() {
         let md = html_to_markdown("<h1>Hello</h1><p>World</p>");
-        // htmd produces ATX-style headings by default
         assert!(md.contains("Hello"), "missing heading: {md}");
         assert!(md.contains("World"), "missing paragraph: {md}");
         assert!(md.contains('#'), "missing # marker: {md}");
