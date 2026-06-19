@@ -659,8 +659,8 @@ pub fn extract_main_content_v3(
     situation: Option<&SituationReport>,
 ) -> ExtractionResultWithReason {
     use crate::content::situation_aware_decision;
-    let decision = situation_aware_decision(situation, html);
     let base = extract_main_content_v2(html);
+    let decision = situation_aware_decision(situation, html, &base);
     ExtractionResultWithReason {
         reason: decision.reason,
         situation_kind: decision.situation_kind,
@@ -684,16 +684,38 @@ pub struct SituationDecision {
 }
 
 /// Pure function: given a situation report (and the raw HTML for size
-/// hints), decide how to label and possibly re-score the extraction.
-/// Exposed at module scope so unit tests can hit it without a document.
+/// hints, plus the v2 baseline result), decide how to label and possibly
+/// re-score the extraction.
+///
+/// **Important**: the situation *never* downgrades a high-quality v2
+/// result. If v2 found 50k characters of real content, the fact that
+/// the request went through Cloudflare's CDN does not turn that into
+/// an "anti-bot block". A real anti-bot block is one where the body is
+/// the challenge page itself (small, full of "checking your browser"),
+/// not one where the body is the article you wanted to read.
+///
+/// The decision is:
+///   1. If the situation is `CleanSuccess` (or no situation was
+///      provided), pass through v2 untouched.
+///   2. If v2 already produced a low-quality result (quality < 0.3 OR
+///      markdown < 500 chars), trust the situation: tag the result
+///      with the situation-derived reason and override the quality to
+///      the appropriate low value.
+///   3. If v2 produced a high-quality result but the situation
+///      indicates a problem, **surface the situation in `reason` for
+///      operator visibility** but do NOT override the quality. The
+///      v2 score reflects what we actually extracted.
 pub fn situation_aware_decision(
     situation: Option<&SituationReport>,
     html: &str,
+    base: &ExtractionResult,
 ) -> SituationDecision {
+    let high_quality = base.quality >= 0.3 && base.markdown.len() >= 500;
+
     let Some(rep) = situation else {
-        // No situation: legacy behaviour, reason = whatever the v2
-        // path returned. We default to Strict here, the actual reason
-        // is filled in by the caller after the v2 run.
+        // No situation: legacy behaviour, no override. The reason is
+        // left at `Strict` (or whatever the caller sets); the v2 path
+        // already produced the right value.
         return SituationDecision {
             reason: ExtractionReason::Strict,
             quality_override: None,
@@ -702,6 +724,21 @@ pub fn situation_aware_decision(
     };
     let kind = rep.kind;
     let kind_str = Some(kind.as_str().to_string());
+
+    if high_quality {
+        // v2 found real content. The situation might still be useful
+        // for the operator (e.g. "this page went through Cloudflare's
+        // CDN") but it must not poison the quality score. We tag the
+        // reason for visibility but skip the override.
+        return SituationDecision {
+            reason: ExtractionReason::Strict,
+            quality_override: None,
+            situation_kind: kind_str,
+        };
+    }
+
+    // v2 produced a low-quality result. Trust the situation to label
+    // it correctly.
     if matches!(kind, SituationKind::SoftNotFound) {
         return SituationDecision {
             reason: ExtractionReason::SoftNotFound,
@@ -741,7 +778,8 @@ pub fn situation_aware_decision(
         };
     }
     // Clean success / unknown / anything we didn't classify above.
-    // The v2 path will still run and produce its own quality score.
+    // The v2 path already produced the right value; just pass it
+    // through with the right reason.
     if html.trim().len() < 200 {
         return SituationDecision {
             reason: ExtractionReason::Empty,
@@ -2086,9 +2124,76 @@ mod tests {
             crw_antibot::SituationKind::CleanSuccess,
             crw_antibot::SuggestedLadder::None,
         );
-        let d = situation_aware_decision(Some(&report), html);
+        let base = extract_main_content_v2(html);
+        let d = situation_aware_decision(Some(&report), html, &base);
         assert_eq!(d.reason, ExtractionReason::Empty);
         assert_eq!(d.quality_override, Some(0.05));
+    }
+
+    #[test]
+    fn situation_does_not_downgrade_high_quality_v2_result() {
+        // Regression test for Phase C's "false positive" bug: a real
+        // Wikipedia article served through Cloudflare's CDN must NOT be
+        // tagged as `AntiBotBlock` just because the response has a
+        // `cf-ray` header. The v2 result is high-quality, so the
+        // situation should be surfaced (kind recorded) but the quality
+        // override must be skipped.
+        let html = r#"<html><body>
+            <div id="mw-content-text">
+                <h1>Rust</h1>
+                <p>Rust is a systems programming language with a focus on safety, speed,
+                and concurrency. It accomplishes these goals by being memory safe without
+                using garbage collection. Rust provides memory safety without garbage
+                collection, and uses a borrow checker to validate reference lifetimes.</p>
+                <p>The language has grown rapidly in popularity and is now used by major
+                companies including Mozilla, Microsoft, Amazon, Google, and Dropbox for
+                systems-level programming tasks where performance and reliability matter.</p>
+            </div>
+        </body></html>"#;
+        let report = synth_report(
+            crw_antibot::SituationKind::CloudflareIuam,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        let v2 = extract_main_content_v2(html);
+        let v3 = extract_main_content_v3(html, Some(&report));
+        // v2 found real content
+        assert!(v2.quality >= 0.3, "v2 baseline should be high quality");
+        assert!(
+            v2.markdown.len() >= 500,
+            "v2 baseline should have real text"
+        );
+        // v3 must NOT downgrade the quality
+        assert!(
+            v3.result.quality >= 0.3,
+            "v3 quality {} should be at least v2 quality {}",
+            v3.result.quality,
+            v2.quality
+        );
+        // The reason stays Strict (real content was found) — but the
+        // situation kind is recorded for the operator.
+        assert_eq!(v3.reason, ExtractionReason::Strict);
+        assert_eq!(v3.situation_kind.as_deref(), Some("cloudflare_iuam"));
+    }
+
+    #[test]
+    fn situation_downgrades_low_quality_v2_result() {
+        // The dual of the previous test: a SPA shell with a Cloudflare
+        // signature should be tagged as AntiBotBlock with low quality.
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Just a moment...</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+</head><body>cf-mitigated</body></html>"#;
+        let report = synth_report(
+            crw_antibot::SituationKind::CloudflareIuam,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        let v2 = extract_main_content_v2(html);
+        let v3 = extract_main_content_v3(html, Some(&report));
+        // v2 should be low quality (challenge page)
+        assert!(v2.quality < 0.3 || v2.markdown.len() < 500);
+        // v3 should be tagged and overridden
+        assert_eq!(v3.reason, ExtractionReason::AntiBotBlock);
+        assert!(v3.result.quality <= 0.05);
     }
 
     #[test]
