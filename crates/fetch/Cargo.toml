@@ -6,10 +6,11 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-# Enable Chrome 131 / Firefox 128 / Safari 18 TLS+HTTP/2 fingerprinting on the
-# HTTP path via the `wreq` crate (BoringSSL-backed). The default build is
-# fingerprinting-on so we ship the strongest TLS profile we can.
-default = ["tls-fingerprint"]
+# Chrome 131 / Firefox 128 / Safari 18 TLS+HTTP/2 fingerprinting on the HTTP
+# path via the `wreq` crate (BoringSSL-backed). Default build is OFF to keep
+# the production image lean (no cmake / C toolchain dependency at build time).
+# Enable with: cargo build --features tls-fingerprint
+# (Dockerfile.dev enables it by default.)
 tls-fingerprint = ["dep:wreq", "dep:wreq-util"]
 
 [dependencies]

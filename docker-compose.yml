@@ -10,8 +10,9 @@ services:
       - HOST=0.0.0.0
       - PORT=3002
       # SEARXNG_URL=http://host.docker.internal:8080
-      # SEARXNG_TOKEN=
-      # AUTH_TOKEN=
+      # FLARESOLVERR_URL=http://192.168.1.101:8666 (disabled: regresses Leboncoin/Amazon)
+      # SEARXNG_TOKEN=***
+      # AUTH_TOKEN=***
       # STEALTH_ENABLED=true
       # BEHAVIORAL_SIMULATION=true
       # SCRAPE_DELAY_PRESET=polite

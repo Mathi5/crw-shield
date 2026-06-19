@@ -7,6 +7,9 @@ authors.workspace = true
 
 [dependencies]
 crw-core = { path = "../core" }
+# Phase C: situation-aware extraction (`extract_main_content_v3`).
+# crw-antibot is a leaf crate, so this dep is acyclic.
+crw-antibot = { path = "../antibot" }
 scraper = { workspace = true }
 ego-tree = "0.10"
 htmd = { workspace = true }

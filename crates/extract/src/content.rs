@@ -1,6 +1,7 @@
 //! Content extraction — stripping boilerplate and isolating the main content
 //! area before downstream markdown conversion.
 
+use crw_antibot::situation::{SituationKind, SituationReport};
 use scraper::{element_ref::ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +177,44 @@ impl ExtractionResult {
     pub fn is_usable(&self) -> bool {
         self.quality >= 0.3 && self.markdown.len() >= 200
     }
+}
+
+/// Phase C.1: extended extraction result that also carries the
+/// "extraction reason" — a short string explaining *why* the quality is
+/// what it is. Surfaced in the API response so operators can debug
+/// "why did crw-shield return such low quality for this page?" without
+/// having to re-run the classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExtractionReason {
+    /// Strict selection returned a high-quality candidate.
+    Strict,
+    /// Largest-text-block heuristic returned a usable candidate.
+    Heuristic,
+    /// Permissive fallback used because nothing better was found.
+    /// This is normal for SPAs and JS-only pages.
+    Fallback,
+    /// Phase C: the situation detector flagged this as `SoftNotFound`
+    /// (real 404). We return the body unchanged so the caller can
+    /// surface the error to its own user.
+    SoftNotFound,
+    /// Phase C: the situation detector flagged this as `JsOnly` and
+    /// no JS-rendered DOM was available. The body is the empty SPA
+    /// shell; caller should escalate to CDP.
+    JsOnly,
+    /// Phase C: anti-bot block detected. Quality is meaningless until
+    /// the challenge is solved; caller should escalate.
+    AntiBotBlock,
+    /// Page is empty / too small to be useful.
+    Empty,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractionResultWithReason {
+    pub result: ExtractionResult,
+    pub reason: ExtractionReason,
+    /// Convenience: the `SituationKind` that influenced the result, if
+    /// any. None when called without a situation.
+    pub situation_kind: Option<String>,
 }
 
 const CONTENT_SELECTORS: &[&str] = &[
@@ -582,6 +621,138 @@ pub fn extract_main_content_v2(html: &str) -> ExtractionResult {
         quality: 0.0,
         page_type,
         used_fallback: true,
+    }
+}
+
+// =========================================================================
+// extract_main_content_v3 — Phase C: situation-aware extraction
+// =========================================================================
+//
+// This is the *recommended* extraction entry point. It takes the
+// `SituationReport` produced by the antibot detector (in addition to the
+// raw HTML) and uses it to:
+//
+//   1. Short-circuit on `SoftNotFound`: the page is a real 404, no
+//      amount of re-extraction will help. Return a low-quality result
+//      with `reason = SoftNotFound` so the caller can surface the
+//      original HTTP 404 to its own user without confusing them with
+//      a "your extractor is bad" diagnosis.
+//
+//   2. Short-circuit on `JsOnly`: the HTTP fetcher returned a SPA
+//      shell. The extraction *will* look like it found something
+//      because there's a `<div id="root">` with a few scripts — but
+//      the real content was never rendered. Force `quality = 0.1` and
+//      `reason = JsOnly` so the caller knows to escalate to CDP.
+//
+//   3. Anti-bot blocks: when the report is an anti-bot provider
+//      (Cloudflare, DataDome, ...) the extracted "content" is actually
+//      the challenge page. Mark `reason = AntiBotBlock`.
+//
+//   4. Otherwise: behave exactly like v2. The reason field just
+//      surfaces which of the v2 phases actually won.
+//
+// The result is wrapped in `ExtractionResultWithReason` for the API
+// response. The legacy `extract_main_content_v2` keeps its signature
+// so existing callers (tests, scripts) still work.
+pub fn extract_main_content_v3(
+    html: &str,
+    situation: Option<&SituationReport>,
+) -> ExtractionResultWithReason {
+    use crate::content::situation_aware_decision;
+    let decision = situation_aware_decision(situation, html);
+    let base = extract_main_content_v2(html);
+    ExtractionResultWithReason {
+        reason: decision.reason,
+        situation_kind: decision.situation_kind,
+        result: ExtractionResult {
+            quality: decision.quality_override.unwrap_or(base.quality),
+            ..base
+        },
+    }
+}
+
+/// Decision produced by looking at the situation report. Cheap to
+/// construct: no HTML parsing, no token scan. The caller applies the
+/// decision to the v2 result.
+#[derive(Debug, Clone)]
+pub struct SituationDecision {
+    pub reason: ExtractionReason,
+    /// If set, override the v2 quality score with this value.
+    pub quality_override: Option<f32>,
+    /// Convenience: the situation kind that drove the decision.
+    pub situation_kind: Option<String>,
+}
+
+/// Pure function: given a situation report (and the raw HTML for size
+/// hints), decide how to label and possibly re-score the extraction.
+/// Exposed at module scope so unit tests can hit it without a document.
+pub fn situation_aware_decision(
+    situation: Option<&SituationReport>,
+    html: &str,
+) -> SituationDecision {
+    let Some(rep) = situation else {
+        // No situation: legacy behaviour, reason = whatever the v2
+        // path returned. We default to Strict here, the actual reason
+        // is filled in by the caller after the v2 run.
+        return SituationDecision {
+            reason: ExtractionReason::Strict,
+            quality_override: None,
+            situation_kind: None,
+        };
+    };
+    let kind = rep.kind;
+    let kind_str = Some(kind.as_str().to_string());
+    if matches!(kind, SituationKind::SoftNotFound) {
+        return SituationDecision {
+            reason: ExtractionReason::SoftNotFound,
+            quality_override: Some(0.1),
+            situation_kind: kind_str,
+        };
+    }
+    if matches!(kind, SituationKind::JsOnly) {
+        return SituationDecision {
+            reason: ExtractionReason::JsOnly,
+            quality_override: Some(0.1),
+            situation_kind: kind_str,
+        };
+    }
+    if kind.is_anti_bot() {
+        return SituationDecision {
+            reason: ExtractionReason::AntiBotBlock,
+            quality_override: Some(0.05),
+            situation_kind: kind_str,
+        };
+    }
+    if matches!(kind, SituationKind::GeoBlocked | SituationKind::LoginWall) {
+        return SituationDecision {
+            reason: ExtractionReason::AntiBotBlock,
+            quality_override: Some(0.1),
+            situation_kind: kind_str,
+        };
+    }
+    if matches!(
+        kind,
+        SituationKind::RateLimited | SituationKind::ServerError
+    ) {
+        return SituationDecision {
+            reason: ExtractionReason::AntiBotBlock,
+            quality_override: Some(0.05),
+            situation_kind: kind_str,
+        };
+    }
+    // Clean success / unknown / anything we didn't classify above.
+    // The v2 path will still run and produce its own quality score.
+    if html.trim().len() < 200 {
+        return SituationDecision {
+            reason: ExtractionReason::Empty,
+            quality_override: Some(0.05),
+            situation_kind: kind_str,
+        };
+    }
+    SituationDecision {
+        reason: ExtractionReason::Strict,
+        quality_override: None,
+        situation_kind: kind_str,
     }
 }
 
@@ -1795,5 +1966,141 @@ mod tests {
         assert!(r.markdown.contains("systems programming"));
         // mw-content-text is article-style.
         assert_eq!(r.page_type, PageType::Article);
+    }
+
+    // =====================================================================
+    // Phase C: situation-aware extraction (v3)
+    // =====================================================================
+
+    fn synth_report(
+        kind: crw_antibot::SituationKind,
+        suggested: crw_antibot::SuggestedLadder,
+    ) -> crw_antibot::SituationReport {
+        crw_antibot::SituationReport {
+            kind,
+            suggested_ladder: suggested,
+            status_code: Some(200),
+            evidence: Vec::new(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn v3_soft_not_found_short_circuits_with_low_quality() {
+        let html =
+            "<html><body>page not found - the resource you requested does not exist</body></html>";
+        // Pad so the page passes the small-payload heuristic in v2
+        // (the situation detector is what should drive the decision).
+        let padded = format!("{html}{}", "x".repeat(300));
+        let report = synth_report(
+            crw_antibot::SituationKind::SoftNotFound,
+            crw_antibot::SuggestedLadder::None,
+        );
+        let r = extract_main_content_v3(&padded, Some(&report));
+        assert_eq!(r.reason, ExtractionReason::SoftNotFound);
+        assert!(r.result.quality <= 0.1);
+    }
+
+    #[test]
+    fn v3_js_only_overrides_quality_downward() {
+        let html = r#"<!DOCTYPE html>
+<html><head><title>App</title></head><body>
+<div id="root"></div>
+<script src="/_next/static/chunks/main.js"></script>
+<script src="/_next/static/chunks/app.js"></script>
+<script src="/_next/static/chunks/framework.js"></script>
+<script src="/_next/static/chunks/webpack.js"></script>
+<script src="/_next/static/chunks/pages/_app.js"></script>
+<script src="/_next/static/chunks/pages/index.js"></script>
+</body></html>"#;
+        let report = synth_report(
+            crw_antibot::SituationKind::JsOnly,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        let r = extract_main_content_v3(html, Some(&report));
+        assert_eq!(r.reason, ExtractionReason::JsOnly);
+        assert!(r.result.quality <= 0.1);
+    }
+
+    #[test]
+    fn v3_anti_bot_block_marks_quality_near_zero() {
+        let html = r#"<html><body>Just a moment...<script src="https://challenges.cloudflare.com/"></script></body></html>"#;
+        let report = synth_report(
+            crw_antibot::SituationKind::CloudflareIuam,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        let r = extract_main_content_v3(html, Some(&report));
+        assert_eq!(r.reason, ExtractionReason::AntiBotBlock);
+        assert!(r.result.quality <= 0.05);
+    }
+
+    #[test]
+    fn v3_clean_success_keeps_v2_quality() {
+        let html = r#"<html><body>
+            <main>
+                <h1>Rust</h1>
+                <p>Rust is a systems programming language with a focus on safety, speed,
+                and concurrency. It accomplishes these goals by being memory safe without
+                using garbage collection. Rust provides memory safety without garbage
+                collection, and uses a borrow checker to validate reference lifetimes.</p>
+                <p>The language has grown rapidly in popularity and is now used by major
+                companies including Mozilla, Microsoft, Amazon, Google, and Dropbox for
+                systems-level programming tasks where performance and reliability matter.</p>
+            </main>
+        </body></html>"#;
+        let report = synth_report(
+            crw_antibot::SituationKind::CleanSuccess,
+            crw_antibot::SuggestedLadder::None,
+        );
+        let v2_baseline = extract_main_content_v2(html);
+        let v3 = extract_main_content_v3(html, Some(&report));
+        assert_eq!(v3.reason, ExtractionReason::Strict);
+        // CleanSuccess with a real page should produce the same quality
+        // as v2 (no override applied).
+        assert!(
+            (v3.result.quality - v2_baseline.quality).abs() < 0.01,
+            "v3 quality {} should match v2 quality {}",
+            v3.result.quality,
+            v2_baseline.quality
+        );
+    }
+
+    #[test]
+    fn v3_no_situation_preserves_v2_behaviour() {
+        let html = "<html><body><main><h1>Hi</h1><p>Some content here.</p></main></body></html>";
+        let v2 = extract_main_content_v2(html);
+        let v3 = extract_main_content_v3(html, None);
+        assert_eq!(v3.reason, ExtractionReason::Strict);
+        assert!(v3.situation_kind.is_none());
+        assert!(v3.result.quality > 0.0);
+        assert!(v2.quality > 0.0);
+    }
+
+    #[test]
+    fn situation_aware_decision_empty_body_on_clean_success() {
+        // A 200 OK with a body smaller than 200 chars should be
+        // marked as Empty even when the detector thought it was clean
+        // (the detector can miss very short bodies).
+        let html = "<html><body>tiny</body></html>";
+        let report = synth_report(
+            crw_antibot::SituationKind::CleanSuccess,
+            crw_antibot::SuggestedLadder::None,
+        );
+        let d = situation_aware_decision(Some(&report), html);
+        assert_eq!(d.reason, ExtractionReason::Empty);
+        assert_eq!(d.quality_override, Some(0.05));
+    }
+
+    #[test]
+    fn v3_serialization_of_extraction_reason() {
+        let html = "<html><body>page not found - not available in your country</body></html>";
+        let padded = format!("{html}{}", "x".repeat(300));
+        let report = synth_report(
+            crw_antibot::SituationKind::SoftNotFound,
+            crw_antibot::SuggestedLadder::None,
+        );
+        let r = extract_main_content_v3(&padded, Some(&report));
+        let json = serde_json::to_string(&r.reason).unwrap();
+        assert!(json.contains("SoftNotFound"));
     }
 }

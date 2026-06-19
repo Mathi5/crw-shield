@@ -814,6 +814,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Chromium binary on PATH; run with `cargo test -- --ignored`"]
     fn build_browser_config_succeeds() {
         let f = CdpFetcher::with_default();
         let cfg = f.build_browser_config();

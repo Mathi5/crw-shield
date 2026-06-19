@@ -14,7 +14,7 @@ use crw_core::{
 };
 use crw_crawl::{crw_crawl, FetcherScrapeRunner};
 use crw_extract::{
-    extract_links, extract_main_content_v2, extract_metadata, filter_tags, html_to_markdown,
+    extract_links, extract_main_content_v3, extract_metadata, filter_tags, html_to_markdown,
 };
 use crw_map::discover as map_discover;
 use crw_search::SearchClient;
@@ -79,12 +79,18 @@ async fn handle_scrape(
     let mut html_for_extraction = fetch_result.html.clone();
     let mut extraction_quality: Option<f32> = None;
     let mut page_type: Option<String> = None;
+    let mut extraction_reason: Option<String> = None;
 
     if req.only_main_content {
-        let result = extract_main_content_v2(&html_for_extraction);
-        html_for_extraction = result.markdown;
-        extraction_quality = Some(result.quality);
-        page_type = Some(format!("{:?}", result.page_type).to_lowercase());
+        // Phase C: situation-aware extraction. v3 consults the
+        // SituationReport to short-circuit on SoftNotFound / JsOnly /
+        // anti-bot blocks — producing a tagged reason so the API
+        // response makes the diagnosis clear.
+        let v3 = extract_main_content_v3(&html_for_extraction, Some(&situation));
+        html_for_extraction = v3.result.markdown;
+        extraction_quality = Some(v3.result.quality);
+        page_type = Some(format!("{:?}", v3.result.page_type).to_lowercase());
+        extraction_reason = Some(format!("{:?}", v3.reason).to_lowercase());
     }
     if !req.include_tags.is_empty() || !req.exclude_tags.is_empty() {
         html_for_extraction =
@@ -100,6 +106,7 @@ async fn handle_scrape(
         extraction_quality,
         page_type,
         situation: Some(situation),
+        extraction_reason: extraction_reason.clone(),
         ..metadata
     };
 

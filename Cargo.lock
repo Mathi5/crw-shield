@@ -543,6 +543,7 @@ dependencies = [
 name = "crw-extract"
 version = "0.1.0"
 dependencies = [
+ "crw-antibot",
  "crw-core",
  "ego-tree",
  "htmd",

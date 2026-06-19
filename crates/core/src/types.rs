@@ -208,6 +208,13 @@ pub struct ScrapeMetadata {
     /// detection. Optional so existing serialised payloads still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub situation: Option<SituationReport>,
+    /// Phase C: short string explaining *why* the extraction ended up
+    /// at the quality score it did. Useful for debugging without
+    /// re-running the classifier. Values: "strict", "heuristic",
+    /// "fallback", "soft_not_found", "js_only", "anti_bot_block",
+    /// "empty".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

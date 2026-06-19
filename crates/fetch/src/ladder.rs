@@ -183,6 +183,49 @@ impl FetchLadder {
         detect_empty_or_blocked(html)
     }
 
+    /// Phase C.3 — adaptive retry decision.
+    ///
+    /// Given the quality of the first pass and the situation report,
+    /// decide whether the ladder should retry with a stronger backend.
+    /// Returns `true` only when:
+    ///   1. The first pass produced low-quality content
+    ///      (`quality < LOW_QUALITY_THRESHOLD`).
+    ///   2. The situation is one we *know* a stronger backend can solve
+    ///      (JS-only, or generic anti-bot block).
+    ///   3. We have not already tried the stronger backend.
+    ///
+    /// The decision is intentionally conservative: we never retry
+    /// `SoftNotFound`, `ServerError`, `RateLimited`, `GeoBlocked` —
+    /// re-hitting those with the same ladder step would just waste time.
+    pub fn should_retry_for_quality(
+        quality: f32,
+        situation: &SituationReport,
+        flaresolverr_available: bool,
+        flaresolverr_already_tried: bool,
+    ) -> bool {
+        const LOW_QUALITY_THRESHOLD: f32 = 0.3;
+        if quality >= LOW_QUALITY_THRESHOLD {
+            return false;
+        }
+        // Only retry when the *cause* of the low quality is something a
+        // stronger backend can fix.
+        let retryable = matches!(
+            situation.kind,
+            crw_antibot::SituationKind::JsOnly | crw_antibot::SituationKind::CleanSuccess
+        ) || (situation.kind.is_anti_bot()
+            && !matches!(situation.suggested_ladder, SuggestedLadder::FlareSolverr));
+        if !retryable {
+            return false;
+        }
+        if situation.suggested_ladder == SuggestedLadder::FlareSolverr && !flaresolverr_available {
+            return false;
+        }
+        if flaresolverr_already_tried {
+            return false;
+        }
+        true
+    }
+
     /// Run the HTTP fetcher.
     async fn try_http(&self, request: &ScrapeRequest) -> Result<FetchResult> {
         self.http.fetch(request).await
@@ -698,5 +741,102 @@ mod tests {
         let _ladder_no_fs = FetchLadder::new(http.clone(), None, None);
         let fs = Arc::new(FlareSolverrClient::new("http://localhost:8191").unwrap());
         let _ladder_with_fs = FetchLadder::new(http, None, Some(fs));
+    }
+
+    // =====================================================================
+    // Phase C.3: should_retry_for_quality
+    // =====================================================================
+
+    fn synth_situation(
+        kind: crw_antibot::SituationKind,
+        suggested: crw_antibot::SuggestedLadder,
+    ) -> SituationReport {
+        SituationReport {
+            kind,
+            suggested_ladder: suggested,
+            status_code: Some(200),
+            evidence: Vec::new(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn retry_skipped_when_quality_is_acceptable() {
+        let s = synth_situation(
+            crw_antibot::SituationKind::JsOnly,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        assert!(!FetchLadder::should_retry_for_quality(0.7, &s, true, false));
+        assert!(!FetchLadder::should_retry_for_quality(0.4, &s, true, false));
+    }
+
+    #[test]
+    fn retry_triggered_for_js_only_with_low_quality() {
+        let s = synth_situation(
+            crw_antibot::SituationKind::JsOnly,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        assert!(FetchLadder::should_retry_for_quality(0.1, &s, true, false));
+    }
+
+    #[test]
+    fn retry_skipped_for_soft_not_found() {
+        // Soft 404 cannot be fixed by retrying — the page is just gone.
+        let s = synth_situation(
+            crw_antibot::SituationKind::SoftNotFound,
+            crw_antibot::SuggestedLadder::None,
+        );
+        assert!(!FetchLadder::should_retry_for_quality(
+            0.05, &s, true, false
+        ));
+    }
+
+    #[test]
+    fn retry_skipped_for_rate_limited() {
+        let s = synth_situation(
+            crw_antibot::SituationKind::RateLimited,
+            crw_antibot::SuggestedLadder::RetryWithDelay,
+        );
+        assert!(!FetchLadder::should_retry_for_quality(0.1, &s, true, false));
+    }
+
+    #[test]
+    fn retry_skipped_for_geo_block() {
+        let s = synth_situation(
+            crw_antibot::SituationKind::GeoBlocked,
+            crw_antibot::SuggestedLadder::None,
+        );
+        assert!(!FetchLadder::should_retry_for_quality(0.1, &s, true, false));
+    }
+
+    #[test]
+    fn retry_skipped_when_flaresolverr_already_tried() {
+        let s = synth_situation(
+            crw_antibot::SituationKind::JsOnly,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        assert!(!FetchLadder::should_retry_for_quality(0.1, &s, true, true));
+    }
+
+    #[test]
+    fn retry_skipped_when_datadome_without_flaresolverr() {
+        // DataDome already suggests FlareSolverr; if it's not available
+        // there's no point in retrying.
+        let s = synth_situation(
+            crw_antibot::SituationKind::DataDomeCaptcha,
+            crw_antibot::SuggestedLadder::FlareSolverr,
+        );
+        assert!(!FetchLadder::should_retry_for_quality(
+            0.05, &s, false, false
+        ));
+    }
+
+    #[test]
+    fn retry_triggered_for_cloudflare_iuam_with_flaresolverr() {
+        let s = synth_situation(
+            crw_antibot::SituationKind::CloudflareIuam,
+            crw_antibot::SuggestedLadder::Cdp,
+        );
+        assert!(FetchLadder::should_retry_for_quality(0.1, &s, true, false));
     }
 }
