@@ -2,6 +2,8 @@ pub mod cdp;
 pub mod flaresolverr;
 pub mod http;
 pub mod ladder;
+#[cfg(feature = "tls-fingerprint")]
+pub mod tls_profile;
 
 pub use cdp::{chrome_available, CdpConfig, CdpFetchResult, CdpFetcher};
 pub use flaresolverr::{CookieInfo, FlareSolverrClient, FlareSolverrResult};
@@ -10,3 +12,5 @@ pub use ladder::{
     metadata_from_fetch, scrape_data_from_ladder, scrape_via_ladder, FetchLadder, FetchSource,
     LadderResult,
 };
+#[cfg(feature = "tls-fingerprint")]
+pub use tls_profile::{build_wreq_client, pick_emulation_for_profile, BrowserEmulation};

@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Enable Chrome 131 / Firefox 128 / Safari 18 TLS+HTTP/2 fingerprinting on the
+# HTTP path via the `wreq` crate (BoringSSL-backed). The default build is
+# fingerprinting-on so we ship the strongest TLS profile we can.
+default = ["tls-fingerprint"]
+tls-fingerprint = ["dep:wreq", "dep:wreq-util"]
+
 [dependencies]
 crw-core = { path = "../core" }
 crw-antibot = { path = "../antibot" }
@@ -19,6 +26,8 @@ chromiumoxide = { workspace = true }
 futures = { workspace = true }
 base64 = "0.22"
 fastrand = "2"
+wreq = { workspace = true, optional = true }
+wreq-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 mockito = { workspace = true }

@@ -1,15 +1,26 @@
 //! HTTP fetch abstraction.
+//!
+//! The default `HttpFetcher` is built on top of `reqwest` (rustls). When the
+//! `tls-fingerprint` feature is enabled (which is the default feature set for
+//! this crate), the fetcher transparently uses a `wreq`-backed client instead
+//! so that the TLS ClientHello, HTTP/2 SETTINGS and header order on the wire
+//! match a real browser — see `tls_profile.rs` and `TLS_FINGERPRINT_RESEARCH.md`
+//! for the rationale and the matching logic.
 
 use async_trait::async_trait;
+#[cfg(not(feature = "tls-fingerprint"))]
+use crw_antibot::http_stealth::USER_AGENTS;
 use crw_antibot::{
-    http_stealth::USER_AGENTS, BrowserProfile, CookieJar, DelayPreset, RequestDelay,
-    StealthHeaders, UserAgentRotator, BROWSER_PROFILES,
+    BrowserProfile, CookieJar, DelayPreset, RequestDelay, StealthHeaders, UserAgentRotator,
+    BROWSER_PROFILES,
 };
 use crw_core::{CrwError, Result, ScrapeRequest};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use url::Url;
+
+#[cfg(feature = "tls-fingerprint")]
+use crate::tls_profile::build_wreq_client;
 
 /// Result of a single HTTP fetch.
 #[derive(Debug, Clone)]
@@ -27,9 +38,30 @@ pub trait Fetcher: Send + Sync {
     async fn fetch(&self, request: &ScrapeRequest) -> Result<FetchResult>;
 }
 
-/// Real HTTP fetcher built on `reqwest` with anti-bot stealth headers.
+/// Underlying HTTP client. When the `tls-fingerprint` feature is on, requests
+/// flow through `wreq` with a Chrome/Firefox/Safari emulation. Otherwise the
+/// path is the same as before — pure `reqwest` + rustls.
+enum HttpClient {
+    Reqwest(reqwest::Client),
+    #[cfg(feature = "tls-fingerprint")]
+    Wreq(wreq::Client),
+}
+
+impl HttpClient {
+    fn reqwest(c: reqwest::Client) -> Self {
+        HttpClient::Reqwest(c)
+    }
+
+    #[cfg(feature = "tls-fingerprint")]
+    fn wreq(c: wreq::Client) -> Self {
+        HttpClient::Wreq(c)
+    }
+}
+
+/// Real HTTP fetcher built on `reqwest` (or `wreq` when the `tls-fingerprint`
+/// feature is enabled) with anti-bot stealth headers.
 pub struct HttpFetcher {
-    client: reqwest::Client,
+    client: HttpClient,
     ua_rotator: Mutex<UserAgentRotator>,
     delay: RequestDelay,
     stealth_enabled: bool,
@@ -56,11 +88,25 @@ impl HttpFetcher {
         preset: DelayPreset,
         cookies: Arc<CookieJar>,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms as u64))
-            .user_agent(USER_AGENTS[0])
-            .build()
-            .map_err(|e| CrwError::Fetch(e.to_string()))?;
+        #[cfg(feature = "tls-fingerprint")]
+        let client = {
+            // Pick the Chrome 131 emulation for the default fetcher: the
+            // vast majority of real-world traffic looks like Chrome on
+            // Windows, and `wreq_util::Chrome131` ships the byte-perfect
+            // cipher suite order + extensions we need.
+            let client = build_wreq_client(wreq_util::Emulation::Chrome131, timeout_ms)?;
+            HttpClient::wreq(client)
+        };
+        #[cfg(not(feature = "tls-fingerprint"))]
+        let client = {
+            use std::time::Duration;
+            let c = reqwest::Client::builder()
+                .timeout(Duration::from_millis(u64::from(timeout_ms)))
+                .user_agent(USER_AGENTS[0])
+                .build()
+                .map_err(|e| CrwError::Fetch(e.to_string()))?;
+            HttpClient::reqwest(c)
+        };
         Ok(Self {
             client,
             ua_rotator: Mutex::new(UserAgentRotator::new()),
@@ -70,13 +116,16 @@ impl HttpFetcher {
         })
     }
 
+    /// Inject a caller-supplied `reqwest::Client`. Used by tests that wire
+    /// in a `mockito` server. When the `tls-fingerprint` feature is on, the
+    /// `wreq` code path is exercised by `with_wreq_client` instead.
     pub fn with_client(
         client: reqwest::Client,
         stealth_enabled: bool,
         preset: DelayPreset,
     ) -> Self {
         Self {
-            client,
+            client: HttpClient::reqwest(client),
             ua_rotator: Mutex::new(UserAgentRotator::new()),
             delay: RequestDelay::new(preset),
             stealth_enabled,
@@ -92,12 +141,31 @@ impl HttpFetcher {
         cookies: Arc<CookieJar>,
     ) -> Self {
         Self {
-            client,
+            client: HttpClient::reqwest(client),
             ua_rotator: Mutex::new(UserAgentRotator::new()),
             delay: RequestDelay::new(preset),
             stealth_enabled,
             cookies,
         }
+    }
+
+    /// Construct an `HttpFetcher` that uses a `wreq` client with a specific
+    /// browser emulation. Only available with the `tls-fingerprint` feature.
+    #[cfg(feature = "tls-fingerprint")]
+    pub fn with_wreq_client(
+        emulation: wreq_util::Emulation,
+        stealth_enabled: bool,
+        preset: DelayPreset,
+        cookies: Arc<CookieJar>,
+    ) -> Result<Self> {
+        let client = build_wreq_client(emulation, 30_000)?;
+        Ok(Self {
+            client: HttpClient::wreq(client),
+            ua_rotator: Mutex::new(UserAgentRotator::new()),
+            delay: RequestDelay::new(preset),
+            stealth_enabled,
+            cookies,
+        })
     }
 
     /// Access the cookie jar (used by tests).
@@ -135,6 +203,7 @@ impl Fetcher for HttpFetcher {
         let url = Url::parse(&request.url).map_err(|e| CrwError::InvalidUrl(e.to_string()))?;
         let _ = self.delay.next_delay();
         let profile = self.pick_profile();
+
         let headers_map: HashMap<String, String> = request
             .headers
             .iter()
@@ -146,77 +215,135 @@ impl Fetcher for HttpFetcher {
             StealthHeaders::minimal(&profile, &headers_map)
         };
 
-        let mut req = self.client.get(url.clone());
-        for (k, v) in stealth.as_pairs() {
-            req = req.header(k, v);
-        }
-        // Attach cookies from the shared jar so DataDome `dd`, Amazon
-        // `session-id` / `x-amz-rid`, Cloudflare `cf_clearance`, etc.
-        // round-trip across requests.
-        if let Some(cookie_header) = self.cookies.cookie_header_for(request.url.as_str()) {
-            req = req.header("Cookie", cookie_header);
-        }
+        let cookie_header = self
+            .cookies
+            .cookie_header_for(request.url.as_str())
+            .unwrap_or_default();
+
         if request.skip_tls_verification {
             tracing::warn!(
-                "skip_tls_verification requested but reqwest client was built with verification on"
-            );
-        }
-        if request.mobile {
-            req = req.header(
-                "Sec-CH-UA-Mobile",
-                if profile.sec_ch_ua_mobile.is_empty() {
-                    "?0"
-                } else {
-                    profile.sec_ch_ua_mobile
-                },
+                "skip_tls_verification requested but client was built with verification on"
             );
         }
 
-        let response = req
-            .send()
-            .await
-            .map_err(|e| CrwError::Fetch(e.to_string()))?;
-        let status = response.status();
-        let final_url = response.url().to_string();
-        let mut response_headers: HashMap<String, String> = HashMap::new();
-        for (k, v) in response.headers().iter() {
-            response_headers.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
-        }
-        // Persist any cookies the server returned. `Set-Cookie` is the only
-        // header reqwest gives us verbatim in `headers()` — multiple
-        // Set-Cookie headers appear as multiple values.
-        let host_for_cookies = Url::parse(&final_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| request.url.clone());
-        for value in response.headers().get_all("set-cookie").iter() {
-            if let Ok(s) = value.to_str() {
-                self.cookies.set_from_set_cookie(&host_for_cookies, s);
+        let mobile_header = if request.mobile {
+            Some(if profile.sec_ch_ua_mobile.is_empty() {
+                "?0"
+            } else {
+                profile.sec_ch_ua_mobile
+            })
+        } else {
+            None
+        };
+
+        // Dispatch to the underlying client. The two branches share a lot of
+        // shape (status / url / headers / body) but the concrete `Response`
+        // types are not name-compatible, hence the explicit duplication.
+        match &self.client {
+            HttpClient::Reqwest(client) => {
+                let mut req = client.get(url.clone());
+                for (k, v) in stealth.as_pairs() {
+                    req = req.header(k, v);
+                }
+                if !cookie_header.is_empty() {
+                    req = req.header("Cookie", cookie_header.as_str());
+                }
+                if let Some(m) = mobile_header {
+                    req = req.header("Sec-CH-UA-Mobile", m);
+                }
+
+                let response = req
+                    .send()
+                    .await
+                    .map_err(|e| CrwError::Fetch(e.to_string()))?;
+                let status = response.status();
+                let final_url = response.url().to_string();
+                let mut response_headers: HashMap<String, String> = HashMap::new();
+                for (k, v) in response.headers().iter() {
+                    response_headers.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
+                }
+                let host_for_cookies = Url::parse(&final_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| request.url.clone());
+                for value in response.headers().get_all("set-cookie").iter() {
+                    if let Ok(s) = value.to_str() {
+                        self.cookies.set_from_set_cookie(&host_for_cookies, s);
+                    }
+                }
+                let html = response
+                    .text()
+                    .await
+                    .map_err(|e| CrwError::Fetch(e.to_string()))?;
+
+                let status_u16 = status.as_u16();
+                if !status.is_success() && !matches!(status_u16, 403 | 429) {
+                    return Err(CrwError::Http {
+                        status: status_u16,
+                        message: format!("HTTP {status}"),
+                    });
+                }
+                Ok(FetchResult {
+                    url: request.url.clone(),
+                    final_url,
+                    status_code: status_u16,
+                    html,
+                    headers: response_headers,
+                })
+            }
+            #[cfg(feature = "tls-fingerprint")]
+            HttpClient::Wreq(client) => {
+                let mut req = client.get(url.as_str());
+                for (k, v) in stealth.as_pairs() {
+                    req = req.header(k, v);
+                }
+                if !cookie_header.is_empty() {
+                    req = req.header("Cookie", cookie_header.as_str());
+                }
+                if let Some(m) = mobile_header {
+                    req = req.header("Sec-CH-UA-Mobile", m);
+                }
+
+                let response = req
+                    .send()
+                    .await
+                    .map_err(|e| CrwError::Fetch(format!("wreq send: {e}")))?;
+                let status = response.status();
+                let final_url = response.url().to_string();
+                let mut response_headers: HashMap<String, String> = HashMap::new();
+                for (k, v) in response.headers().iter() {
+                    response_headers.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
+                }
+                let host_for_cookies = Url::parse(&final_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| request.url.clone());
+                for value in response.headers().get_all("set-cookie").iter() {
+                    if let Ok(s) = value.to_str() {
+                        self.cookies.set_from_set_cookie(&host_for_cookies, s);
+                    }
+                }
+                let html = response
+                    .text()
+                    .await
+                    .map_err(|e| CrwError::Fetch(format!("wreq body: {e}")))?;
+
+                let status_u16 = status.as_u16();
+                if !status.is_success() && !matches!(status_u16, 403 | 429) {
+                    return Err(CrwError::Http {
+                        status: status_u16,
+                        message: format!("HTTP {status}"),
+                    });
+                }
+                Ok(FetchResult {
+                    url: request.url.clone(),
+                    final_url,
+                    status_code: status_u16,
+                    html,
+                    headers: response_headers,
+                })
             }
         }
-        let html = response
-            .text()
-            .await
-            .map_err(|e| CrwError::Fetch(e.to_string()))?;
-
-        // 403 (Forbidden) and 429 (Too Many Requests) are commonly returned
-        // by anti-bot services when the request is blocked. Surface them as a
-        // successful fetch with the body intact so the ladder can decide
-        // whether to escalate to CDP instead of bubbling the error up.
-        let status_u16 = status.as_u16();
-        if !status.is_success() && !matches!(status_u16, 403 | 429) {
-            return Err(CrwError::Http {
-                status: status_u16,
-                message: format!("HTTP {status}"),
-            });
-        }
-        Ok(FetchResult {
-            url: request.url.clone(),
-            final_url,
-            status_code: status_u16,
-            html,
-            headers: response_headers,
-        })
     }
 }
 
@@ -224,6 +351,7 @@ impl Fetcher for HttpFetcher {
 mod tests {
     use super::*;
     use crw_core::ScrapeRequest;
+    use std::time::Duration;
 
     #[test]
     fn http_fetcher_constructs() {

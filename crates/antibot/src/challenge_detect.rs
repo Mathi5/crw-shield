@@ -44,30 +44,30 @@ pub fn detect_empty_or_blocked(html: &str) -> bool {
     }
 
     // 2. Hard anti-bot landing pages that don't trigger `detect_challenge`.
-       let lower = trimmed.to_ascii_lowercase();
-       const BLOCK_PHRASES: &[&str] = &[
-           "you have been blocked",
-           "access denied",
-           "please verify you are a human",
-           "checking your browser before accessing",
-           "ddc-captcha",        // DataDome captcha container
-           "geo.captcha-delivery",
-           "cf-mitigated",       // Cloudflare mitigation wrapper
-           "pardon our interruption",
-           "request rejected",
-           "this request was blocked",
-           "bot detection",
-           "incapsula",
-           "_Incapsula_Resource",
-           "akamai",              // Akamai bot manager generic
-           "x-amz-rid",           // Amazon request ID hint
-           "security verification", // StackOverflow Cloudflare
-           "performing security verification",
-           "verifying you are human",
-           "attention required",
-           "ray id",              // Cloudflare Ray ID
-           "cf-chl-bypass",
-       ];
+    let lower = trimmed.to_ascii_lowercase();
+    const BLOCK_PHRASES: &[&str] = &[
+        "you have been blocked",
+        "access denied",
+        "please verify you are a human",
+        "checking your browser before accessing",
+        "ddc-captcha", // DataDome captcha container
+        "geo.captcha-delivery",
+        "cf-mitigated", // Cloudflare mitigation wrapper
+        "pardon our interruption",
+        "request rejected",
+        "this request was blocked",
+        "bot detection",
+        "incapsula",
+        "_Incapsula_Resource",
+        "akamai",                // Akamai bot manager generic
+        "x-amz-rid",             // Amazon request ID hint
+        "security verification", // StackOverflow Cloudflare
+        "performing security verification",
+        "verifying you are human",
+        "attention required",
+        "ray id", // Cloudflare Ray ID
+        "cf-chl-bypass",
+    ];
     for phrase in BLOCK_PHRASES {
         if lower.contains(phrase) {
             return true;

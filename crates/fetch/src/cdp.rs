@@ -444,9 +444,98 @@ fn is_ecommerce_host(url: &str) -> bool {
 /// enough to satisfy DataDome and Akamai's "is the page actually being
 /// interacted with?" heuristics on simple static endpoints.
 async fn humanise_pre_extract(page: &Page) {
-    // 1. Wait for `document.readyState === "complete"`. We use a small fixed
-    //    number of polls rather than an event listener because chromiumoxide
-    //    does not expose Page.lifecycleEvent directly.
+    // Cheap, no-budget path: if the operator disabled the dance, skip it
+    // entirely (used by tests and benchmarks).
+    if !humanise_enabled() {
+        return;
+    }
+    humanise_full_session(page).await;
+}
+
+/// Tunable knobs for the pre-extract "humanise" dance. All are read from
+/// env vars on every call so test harnesses can change them at runtime.
+struct HumaniseConfig {
+    delay_min_ms: u64,
+    delay_max_ms: u64,
+    total_budget_ms: u64,
+}
+
+impl HumaniseConfig {
+    fn from_env() -> Self {
+        Self {
+            delay_min_ms: parse_env_u64("HUMANISE_DELAY_MIN_MS", 50),
+            delay_max_ms: parse_env_u64("HUMANISE_DELAY_MAX_MS", 200),
+            total_budget_ms: parse_env_u64("HUMANISE_TOTAL_BUDGET_MS", 5_000),
+        }
+    }
+}
+
+fn parse_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn humanise_enabled() -> bool {
+    parse_env_u64("HUMANISE_ENABLED", 1) != 0
+}
+
+/// 2D cubic Bezier. Used to generate human-looking mouse trajectories
+/// between two screen positions. The control points are jittered by the
+/// caller so each run produces a slightly different curve.
+struct Bezier;
+
+impl Bezier {
+    /// Evaluate a 2D cubic Bezier curve at parameter `t` (in [0, 1]).
+    ///
+    /// `B(t) = (1-t)^3 P0 + 3(1-t)^2 t P1 + 3(1-t) t^2 P2 + t^3 P3`
+    pub fn cubic(
+        p0: (f32, f32),
+        p1: (f32, f32),
+        p2: (f32, f32),
+        p3: (f32, f32),
+        t: f32,
+    ) -> (f32, f32) {
+        let u = 1.0 - t;
+        let b0 = u * u * u;
+        let b1 = 3.0 * u * u * t;
+        let b2 = 3.0 * u * t * t;
+        let b3 = t * t * t;
+        (
+            b0 * p0.0 + b1 * p1.0 + b2 * p2.0 + b3 * p3.0,
+            b0 * p0.1 + b1 * p1.1 + b2 * p2.1 + b3 * p3.1,
+        )
+    }
+}
+
+/// Apply a longer, more realistic sequence of human interactions before
+/// extracting content. Used on e-commerce hosts (or any page that opted
+/// in via `request.wait_for > 0`).
+///
+/// The sequence is:
+///   1. Wait for `document.readyState === "complete"`.
+///   2. 5–10 mouse moves along 2D cubic Bezier curves from the previous
+///      cursor position to a series of pseudo-random targets on the page
+///      (header, content, sidebar, link, etc.).
+///   3. Progressive scroll in 200 px increments every 300–500 ms (jittered)
+///      until 3 viewport-heights of scroll OR the end of the page,
+///      then scroll back to the top in 1–2 chunks.
+///   4. Reading pause: 1–3 s sleep.
+///   5. 0–2 link hovers (hover without click).
+///   6. `Page.bringToFront`.
+///
+/// The whole dance is bounded by `HUMANISE_TOTAL_BUDGET_MS` (default
+/// 5 s) and aborts early if it would exceed the budget. That keeps
+/// the scrape latency predictable even on slow sites.
+pub async fn humanise_full_session(page: &Page) {
+    let cfg = HumaniseConfig::from_env();
+    // Track the start of the dance so we can stop early if we overrun.
+    let start = std::time::Instant::now();
+
+    // 1. Wait for `document.readyState === "complete"`. We use a small
+    //    fixed number of polls rather than an event listener because
+    //    chromiumoxide does not expose Page.lifecycleEvent directly.
     for _ in 0..5 {
         let ready = page
             .evaluate("() => document.readyState")
@@ -457,40 +546,220 @@ async fn humanise_pre_extract(page: &Page) {
         if ready == "complete" {
             break;
         }
+        if !budget_allows(start, 80, cfg.total_budget_ms) {
+            return;
+        }
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
 
-    // 2. Three small mouse moves. We dispatch MouseEvents directly in the
-    //    page because `Input.dispatchMouseEvent` via CDP is more invasive
-    //    (and chromeoxide does not expose it cleanly). The `view: window`
-    //    lets the event travel up to all installed listeners.
-    for (x, y) in [(100u32, 100u32), (300, 200), (500, 350)] {
-        let script = format!(
-            r#"(() => {{
-                try {{
-                    const e = new MouseEvent('mousemove', {{
-                        bubbles: true,
-                        cancelable: true,
-                        clientX: {x},
-                        clientY: {y},
-                        view: window
-                    }});
-                    document.dispatchEvent(e);
-                    window.dispatchEvent(e);
-                }} catch (err) {{}}
-            }})()"#
+    // Pull the viewport once; we use it both for mouse-target generation
+    // and for the "3 viewport-heights of scroll" cap.
+    let viewport = page
+        .evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
+        .await
+        .ok()
+        .and_then(|v| v.into_value::<serde_json::Value>().ok())
+        .map(|raw| {
+            let w = raw.get("w").and_then(|x| x.as_f64()).unwrap_or(1280.0) as f32;
+            let h = raw.get("h").and_then(|x| x.as_f64()).unwrap_or(800.0) as f32;
+            (w, h)
+        })
+        .unwrap_or((1280.0, 800.0));
+    let (vw, vh) = viewport;
+
+    // 2. Mouse moves: 5–10 targets, each traversed along a cubic Bezier
+    //    with jittered control points. We dispatch a `mousemove` event
+    //    at ~5–10 points along each curve.
+    let mut current = (vw * 0.1, vh * 0.5);
+    let target_count = 5 + (fastrand::u64(0..6)) as usize; // 5..=10
+    for i in 0..target_count {
+        // Pick a target within the viewport, biased away from the current
+        // position so the cursor actually moves.
+        let tx = {
+            let lo = current.0.max(40.0);
+            let hi = vw - 40.0;
+            if hi > lo {
+                lo + fastrand::f32() * (hi - lo)
+            } else {
+                current.0
+            }
+        };
+        let ty = {
+            let lo = 40.0_f32;
+            let hi = vh - 40.0;
+            if hi > lo {
+                lo + fastrand::f32() * (hi - lo)
+            } else {
+                current.1
+            }
+        };
+        let target = (tx, ty);
+
+        // Jittered control points: pull them perpendicular to the
+        // start→end line, by up to 30% of the line length.
+        let dx = target.0 - current.0;
+        let dy = target.1 - current.1;
+        let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+        // Perpendicular unit vector (-dy, dx) / dist
+        let px = -dy / dist;
+        let py = dx / dist;
+        let jitter_a = (fastrand::f32() - 0.5) * 0.6 * dist;
+        let jitter_b = (fastrand::f32() - 0.5) * 0.6 * dist;
+        let c1 = (
+            current.0 + dx * 0.33 + px * jitter_a,
+            current.1 + dy * 0.33 + py * jitter_a,
         );
-        let _ = page.evaluate(script).await;
-        // 200-400 ms between moves, with a small jitter.
-        let delay_ms = 200 + (fastrand::u64(0..200));
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let c2 = (
+            current.0 + dx * 0.66 + px * jitter_b,
+            current.1 + dy * 0.66 + py * jitter_b,
+        );
+
+        let samples = 5 + (fastrand::u64(0..6)) as usize; // 5..=10
+        for s in 0..samples {
+            let t = (s as f32) / ((samples - 1) as f32);
+            let (mx, my) = Bezier::cubic(current, c1, c2, target, t);
+            let script = format!(
+                r#"(() => {{
+                    try {{
+                        const e = new MouseEvent('mousemove', {{
+                            bubbles: true,
+                            cancelable: true,
+                            clientX: {mx},
+                            clientY: {my},
+                            view: window
+                        }});
+                        document.dispatchEvent(e);
+                        window.dispatchEvent(e);
+                    }} catch (err) {{}}
+                }})()"#
+            );
+            let _ = page.evaluate(script).await;
+            let delay =
+                cfg.delay_min_ms + (fastrand::u64(0..(cfg.delay_max_ms - cfg.delay_min_ms + 1)));
+            if !budget_allows(start, delay, cfg.total_budget_ms) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        current = target;
+
+        // Mid-way through, occasionally hover an <a> element to add a
+        // touch of "I'm reading the page" behaviour.
+        if i == 2 || i == 5 {
+            if let Err(e) = page.evaluate(HOVER_ANCHOR_JS).await {
+                tracing::debug!(error=?e, "link hover evaluate failed");
+            }
+            if !budget_allows(start, 100, cfg.total_budget_ms) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
-    // 3. Final settle delay before content extraction. Some DataDome/
-    //    Akamai "is this still a bot?" probes fire ~500 ms after DOMContentLoaded.
-    let settle_ms = 300 + (fastrand::u64(0..200));
-    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+    // 3. Progressive scroll. We scroll in 200 px increments every
+    //    300–500 ms (jittered) until we hit the cap or the page end.
+    let max_scroll_px = (vh * 3.0) as i64;
+    let mut scrolled: i64 = 0;
+    while scrolled < max_scroll_px {
+        // Step length jittered around 200 px.
+        let step = 180 + (fastrand::u64(0..41)) as i64; // 180..=220
+        let script = format!(
+            r#"(() => {{
+                const before = window.scrollY;
+                window.scrollBy({{ top: {step}, behavior: 'auto' }});
+                return window.scrollY - before;
+            }})()"#
+        );
+        let actually_scrolled = page
+            .evaluate(script)
+            .await
+            .ok()
+            .and_then(|v| v.into_value::<i64>().ok())
+            .unwrap_or(0);
+        if actually_scrolled <= 0 {
+            // End of page.
+            break;
+        }
+        scrolled += actually_scrolled;
+        let delay = 300 + (fastrand::u64(0..201)); // 300..=500
+        if !budget_allows(start, delay, cfg.total_budget_ms) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+
+    // Scroll back to top in 1–2 chunks.
+    let back_step = (scrolled / 2).max(200);
+    for _ in 0..2 {
+        let _ = page
+            .evaluate(format!(
+                r#"(() => {{
+                    window.scrollBy({{ top: -{back_step}, behavior: 'auto' }});
+                }})()"#
+            ))
+            .await;
+        if !budget_allows(start, 150, cfg.total_budget_ms) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    // Snap to top to undo the last step overshoot.
+    let _ = page
+        .evaluate("() => window.scrollTo({top: 0, behavior: 'auto'})")
+        .await;
+
+    // 4. Reading pause: 1–3 s.
+    let read_ms = 1_000 + (fastrand::u64(0..2_001)); // 1000..=3000
+    if !budget_allows(start, read_ms, cfg.total_budget_ms) {
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(read_ms)).await;
+
+    // 5. Occasional link hover (1–2 times) — we already did 2 inline above;
+    //    add 0–1 more here for a little more entropy.
+    let extra_hovers = (fastrand::u64(0..2)) as usize; // 0..=1
+    for _ in 0..extra_hovers {
+        let _ = page.evaluate(HOVER_ANCHOR_JS).await;
+        if !budget_allows(start, 100, cfg.total_budget_ms) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // 6. Bring the page to the front of the browser tab stack. This is a
+    //    no-op for headless mode but a real-browser signal that some
+    //    fingerprint scorers still look at.
+    let _ = page.bring_to_front().await;
 }
+
+/// Returns true if there is still time left in the humanise budget for an
+/// action that would take `extra_ms` milliseconds.
+fn budget_allows(start: std::time::Instant, extra_ms: u64, total_budget_ms: u64) -> bool {
+    start.elapsed().as_millis() as u64 + extra_ms <= total_budget_ms
+}
+
+/// JS snippet that finds the first visible `<a>` element on the page and
+/// dispatches a `mouseover` + `mousemove` on it (without clicking). The
+/// helper bails out silently if no anchor is found, so it's safe to call
+/// on any page.
+const HOVER_ANCHOR_JS: &str = r#"(() => {
+    try {
+        const links = Array.from(document.querySelectorAll('a'));
+        const visible = links.find(a => {
+            const r = a.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && r.top < window.innerHeight && r.bottom > 0;
+        });
+        if (!visible) return false;
+        const r = visible.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const over = new MouseEvent('mouseover', { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window });
+        const move = new MouseEvent('mousemove', { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window });
+        visible.dispatchEvent(over);
+        visible.dispatchEvent(move);
+        return true;
+    } catch (err) { return false; }
+})()"#;
 
 impl Default for CdpFetcher {
     fn default() -> Self {
@@ -566,5 +835,126 @@ mod tests {
         );
         let r = res.unwrap();
         assert!(r.html.contains("Example Domain") || r.html.contains("example"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Bezier math. The midpoint (t=0.5) of a 2D cubic Bezier with control
+    // points P0..P3 evaluates to:
+    //     B(0.5) = (1/8) P0 + (3/8) P1 + (3/8) P2 + (1/8) P3
+    // (the "De Casteljau midpoint" identity). The test pins that down so
+    // that the JS script we generate from these coordinates is correct.
+    // -----------------------------------------------------------------------
+    const BEZIER_TOLERANCE: f32 = 1e-4;
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() <= BEZIER_TOLERANCE
+    }
+
+    #[test]
+    fn bezier_cubic_at_zero_returns_start_point() {
+        let p0 = (0.0, 0.0);
+        let p1 = (10.0, 20.0);
+        let p2 = (40.0, 80.0);
+        let p3 = (100.0, 200.0);
+        let (x, y) = Bezier::cubic(p0, p1, p2, p3, 0.0);
+        assert!(approx_eq(x, p0.0), "x at t=0 was {x}");
+        assert!(approx_eq(y, p0.1), "y at t=0 was {y}");
+    }
+
+    #[test]
+    fn bezier_cubic_at_one_returns_end_point() {
+        let p0 = (0.0, 0.0);
+        let p1 = (10.0, 20.0);
+        let p2 = (40.0, 80.0);
+        let p3 = (100.0, 200.0);
+        let (x, y) = Bezier::cubic(p0, p1, p2, p3, 1.0);
+        assert!(approx_eq(x, p3.0), "x at t=1 was {x}");
+        assert!(approx_eq(y, p3.1), "y at t=1 was {y}");
+    }
+
+    #[test]
+    fn bezier_cubic_midpoint_matches_de_casteljau_weighted_average() {
+        // The test value the brief calls out: t=0.5 must equal the weighted
+        // average of the four control points with weights 1/8, 3/8, 3/8, 1/8.
+        let p0 = (0.0, 0.0);
+        let p1 = (200.0, 400.0);
+        let p2 = (500.0, 300.0);
+        let p3 = (800.0, 600.0);
+        let (mx, my) = Bezier::cubic(p0, p1, p2, p3, 0.5);
+        let expected_x = 0.125 * p0.0 + 0.375 * p1.0 + 0.375 * p2.0 + 0.125 * p3.0;
+        let expected_y = 0.125 * p0.1 + 0.375 * p1.1 + 0.375 * p2.1 + 0.125 * p3.1;
+        assert!(
+            approx_eq(mx, expected_x),
+            "midpoint x {mx} != expected {expected_x}"
+        );
+        assert!(
+            approx_eq(my, expected_y),
+            "midpoint y {my} != expected {expected_y}"
+        );
+    }
+
+    #[test]
+    fn bezier_cubic_is_strictly_between_endpoints() {
+        // For any non-degenerate cubic where control points lie within the
+        // bounding box, B(t) for t in (0, 1) should stay inside that box.
+        // We test with random but reasonable coordinates.
+        let p0: (f32, f32) = (50.0, 100.0);
+        let p1: (f32, f32) = (120.0, 30.0);
+        let p2: (f32, f32) = (300.0, 220.0);
+        let p3: (f32, f32) = (400.0, 80.0);
+        let lo_x: f32 = p0.0.min(p1.0).min(p2.0).min(p3.0);
+        let hi_x: f32 = p0.0.max(p1.0).max(p2.0).max(p3.0);
+        let lo_y: f32 = p0.1.min(p1.1).min(p2.1).min(p3.1);
+        let hi_y: f32 = p0.1.max(p1.1).max(p2.1).max(p3.1);
+        for step in 1..20 {
+            let t = step as f32 / 20.0;
+            let (x, y) = Bezier::cubic(p0, p1, p2, p3, t);
+            assert!(
+                (lo_x - BEZIER_TOLERANCE..=hi_x + BEZIER_TOLERANCE).contains(&x),
+                "x {x} out of [{lo_x}, {hi_x}] at t={t}"
+            );
+            assert!(
+                (lo_y - BEZIER_TOLERANCE..=hi_y + BEZIER_TOLERANCE).contains(&y),
+                "y {y} out of [{lo_y}, {hi_y}] at t={t}"
+            );
+        }
+    }
+
+    #[test]
+    fn bezier_cubic_with_zero_control_points_is_a_straight_line() {
+        // If both control points coincide with the start and end points
+        // respectively, the curve is just the straight segment P0→P3.
+        let p0 = (0.0, 0.0);
+        let p3 = (100.0, 200.0);
+        // Control points at 1/3 and 2/3 along the segment.
+        let p1 = (100.0 / 3.0, 200.0 / 3.0);
+        let p2 = (2.0 * 100.0 / 3.0, 2.0 * 200.0 / 3.0);
+        for step in 0..=10 {
+            let t = step as f32 / 10.0;
+            let (x, y) = Bezier::cubic(p0, p1, p2, p3, t);
+            let expected_x = 100.0 * t;
+            let expected_y = 200.0 * t;
+            assert!(approx_eq(x, expected_x), "t={t}: x {x} != {expected_x}");
+            assert!(approx_eq(y, expected_y), "t={t}: y {y} != {expected_y}");
+        }
+    }
+
+    #[test]
+    fn humanise_config_defaults_are_sane() {
+        // Make sure the env-var reader doesn't panic and that the fallback
+        // values fall inside the ranges the dance assumes.
+        let cfg = HumaniseConfig::from_env();
+        assert!(cfg.delay_min_ms <= cfg.delay_max_ms);
+        assert!(cfg.total_budget_ms > 0);
+        assert!(cfg.delay_min_ms >= 1);
+    }
+
+    #[test]
+    fn budget_allows_returns_false_when_exhausted() {
+        // Pick a budget that any single millisecond will exceed.
+        let start = std::time::Instant::now();
+        let budget_ms = 0_u64;
+        // A 1ms action should be rejected when the budget is 0.
+        assert!(!budget_allows(start, 1, budget_ms));
     }
 }

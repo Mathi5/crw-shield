@@ -39,6 +39,16 @@ reqwest = { version = "0.12", default-features = false, features = [
     "cookies",
     "rustls-tls",
 ] }
+# TLS-fingerprinting HTTP client (drop-in reqwest replacement backed by BoringSSL).
+# Pulls in `boringssl` which needs cmake + a C/C++ toolchain at build time.
+# We enable `gzip`/`brotli`/`deflate` so the auto-decompression path matches
+# what real browsers do (otherwise wreq returns the raw compressed bytes and
+# the response is unreadable).
+wreq = { version = "5", default-features = false, features = ["gzip", "brotli", "deflate"] }
+# wreq-util's `emulation` feature gates the browser Emulation enum; we enable
+# just that + no compression features (we never expect brotli/zstd on the
+# raw fingerprint path).
+wreq-util = { version = "2", default-features = false, features = ["emulation"] }
 
 # HTML parsing
 scraper = "0.22"

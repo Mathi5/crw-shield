@@ -1,6 +1,6 @@
 FROM rust:1.88-bookworm
 
-# Install Chromium for CDP rendering
+# Install Chromium for CDP rendering + build tools for BoringSSL (wreq TLS fingerprinting)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-sandbox \
@@ -14,6 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxss1 \
     libxtst6 \
     xdg-utils \
+    cmake \
+    build-essential \
+    pkg-config \
+    libclang-dev \
+    perl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chrome path for chromiumoxide
