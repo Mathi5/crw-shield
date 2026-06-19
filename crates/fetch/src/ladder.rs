@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use crw_antibot::detect_challenge;
+use crw_antibot::{detect_challenge, detect_empty_or_blocked, CookieJar};
 use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, ScrapeResponse};
 use tracing::{debug, warn};
 
@@ -57,6 +57,7 @@ pub struct FetchLadder {
     http: Arc<HttpFetcher>,
     cdp: Option<Arc<CdpFetcher>>,
     flaresolverr: Option<Arc<FlareSolverrClient>>,
+    cookies: Arc<CookieJar>,
 }
 
 impl FetchLadder {
@@ -65,11 +66,51 @@ impl FetchLadder {
         cdp: Option<Arc<CdpFetcher>>,
         flaresolverr: Option<Arc<FlareSolverrClient>>,
     ) -> Self {
+        // Fall back to a fresh jar if the HTTP fetcher was built without one
+        // (e.g. by a test that did not go through `with_cookies`). Production
+        // callers wire the same jar through both fetchers via `new_with_cookies`.
+        let cookies = http.cookies();
         Self {
             http,
             cdp,
             flaresolverr,
+            cookies,
         }
+    }
+
+    /// Construct a ladder that shares one cookie jar between the HTTP and
+    /// CDP fetchers. This is the preferred constructor for production code
+    /// because it makes cookies round-trip across escalation steps.
+    pub fn new_with_cookies(
+        cookies: Arc<CookieJar>,
+        flaresolverr: Option<Arc<FlareSolverrClient>>,
+        cdp_enabled: bool,
+        timeout_ms: u32,
+        stealth_enabled: bool,
+        preset: crw_antibot::DelayPreset,
+        cdp_config: Option<crate::cdp::CdpConfig>,
+    ) -> Result<Self> {
+        let http = Arc::new(
+            HttpFetcher::with_cookies(timeout_ms, stealth_enabled, preset, cookies.clone())
+                .map_err(|e| crw_core::CrwError::Fetch(format!("HttpFetcher: {e}")))?,
+        );
+        let cdp = if cdp_enabled {
+            let cfg = cdp_config.unwrap_or_default();
+            Some(Arc::new(CdpFetcher::with_cookies(cfg, cookies.clone())))
+        } else {
+            None
+        };
+        Ok(Self {
+            http,
+            cdp,
+            flaresolverr,
+            cookies,
+        })
+    }
+
+    /// Access the shared cookie jar.
+    pub fn cookies(&self) -> Arc<CookieJar> {
+        self.cookies.clone()
     }
 
     /// Heuristic: should we skip HTTP and go straight to CDP?
@@ -95,12 +136,34 @@ impl FetchLadder {
     /// Decide whether the HTTP response is a challenge page and should be
     /// escalated to CDP. We treat both obvious challenge HTML (Cloudflare,
     /// hCaptcha, ...) and suspicious anti-bot status codes (403, 429) as
-    /// triggers so we can fall back to a real browser.
+    /// triggers so we can fall back to a real browser. We also escalate when
+    /// the response is suspiciously small (< 500 chars) or matches one of the
+    /// known "empty/anti-bot" markers (Amazon 404, DataDome block, ...).
     fn http_is_challenge(fetch: &FetchResult) -> bool {
         if matches!(fetch.status_code, 403 | 429) {
             return true;
         }
-        detect_challenge(&fetch.html).is_some()
+        if detect_challenge(&fetch.html).is_some() {
+            return true;
+        }
+        // For non-200/2xx responses, treat small/blocked HTML as challenge.
+        // For 2xx, a small page is legitimate (e.g. status pages).
+        if !(200..300).contains(&fetch.status_code) {
+            return detect_empty_or_blocked(&fetch.html);
+        }
+        // 2xx but still has anti-bot markers (DataDome etc.)
+        detect_challenge(&fetch.html).is_some() || detect_empty_or_blocked(&fetch.html)
+    }
+
+    /// Decide whether a CDP-rendered page is still an "empty / anti-bot"
+    /// page and should be escalated to FlareSolverr. We deliberately do NOT
+    /// re-check `detect_challenge` here: that function looks for the HTML
+    /// fingerprint of a Cloudflare/hCaptcha interstitial, which a fully-
+    /// rendered browser never sees. Empty/blocked, on the other hand, is the
+    /// case the browser loaded the page successfully but the upstream
+    /// response was a soft block.
+    fn cdp_is_empty_or_blocked(html: &str) -> bool {
+        detect_empty_or_blocked(html)
     }
 
     /// Run the HTTP fetcher.
@@ -179,17 +242,15 @@ impl FetchLadder {
                     if self.cdp.is_some() {
                         match self.try_cdp(request).await {
                             Ok(cdp_res) => {
-                                // If the CDP response STILL looks like a
-                                // challenge and FlareSolverr is configured,
-                                // escalate one more step.
-                                if detect_challenge(&cdp_res.html).is_some() {
-                                    if let Some(fs_result) = self
-                                        .try_flaresolverr(
-                                            &request.url,
-                                            request,
-                                            true,
-                                        )
-                                        .await?
+                                // If the CDP response STILL looks empty or
+                                // blocked AND FlareSolverr is configured,
+                                // escalate one more step. The check now
+                                // covers anti-bot "soft blocks" too (Amazon
+                                // 404, DataDome challenge, ...) in addition
+                                // to the standard challenge HTML.
+                                if Self::cdp_is_empty_or_blocked(&cdp_res.html) {
+                                    if let Some(fs_result) =
+                                        self.try_flaresolverr(&request.url, request, true).await?
                                     {
                                         return Ok(fs_result);
                                     }
@@ -208,9 +269,8 @@ impl FetchLadder {
                             }
                             Err(e) => {
                                 warn!(error=%e, "CDP fallback failed after challenge; trying FlareSolverr");
-                                if let Some(fs_result) = self
-                                    .try_flaresolverr(&request.url, request, true)
-                                    .await?
+                                if let Some(fs_result) =
+                                    self.try_flaresolverr(&request.url, request, true).await?
                                 {
                                     return Ok(fs_result);
                                 }
@@ -223,9 +283,8 @@ impl FetchLadder {
                         }
                     }
                     // No CDP available; try FlareSolverr as a final escalation.
-                    if let Some(fs_result) = self
-                        .try_flaresolverr(&request.url, request, false)
-                        .await?
+                    if let Some(fs_result) =
+                        self.try_flaresolverr(&request.url, request, false).await?
                     {
                         return Ok(fs_result);
                     }
@@ -242,11 +301,10 @@ impl FetchLadder {
                     if self.cdp.is_some() {
                         let cdp_res = self.try_cdp(request).await?;
                         // Escalate to FlareSolverr if the CDP result is still
-                        // a challenge page.
-                        if detect_challenge(&cdp_res.html).is_some() {
-                            if let Some(fs_result) = self
-                                .try_flaresolverr(&request.url, request, true)
-                                .await?
+                        // empty or anti-bot blocked.
+                        if Self::cdp_is_empty_or_blocked(&cdp_res.html) {
+                            if let Some(fs_result) =
+                                self.try_flaresolverr(&request.url, request, true).await?
                             {
                                 return Ok(fs_result);
                             }
@@ -271,10 +329,7 @@ impl FetchLadder {
         // Force CDP path.
         let cdp_res = self.try_cdp(request).await?;
         if detect_challenge(&cdp_res.html).is_some() {
-            if let Some(fs_result) = self
-                .try_flaresolverr(&request.url, request, true)
-                .await?
-            {
+            if let Some(fs_result) = self.try_flaresolverr(&request.url, request, true).await? {
                 return Ok(fs_result);
             }
         }
@@ -423,11 +478,18 @@ mod tests {
 
     #[test]
     fn http_is_challenge_returns_false_for_clean() {
+        let body = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
+                    Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. \
+                    Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris \
+                    nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in \
+                    reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla \
+                    pariatur. Excepteur sint occaecat cupidatat non proident, sunt in \
+                    culpa qui officia deserunt mollit anim id est laborum.";
         let fetch = FetchResult {
             url: "https://x".into(),
             final_url: "https://x".into(),
             status_code: 200,
-            html: "<html><body><p>ok</p></body></html>".into(),
+            html: format!("<html><body><p>{body}</p></body></html>"),
             headers: Default::default(),
         };
         assert!(!FetchLadder::http_is_challenge(&fetch));
@@ -459,12 +521,16 @@ mod tests {
 
     #[test]
     fn http_is_challenge_ignores_other_error_codes() {
+        let body = "Not Found - the requested resource does not exist on this server. \
+                    Please check the URL and try again. If you believe this is an error, \
+                    contact the site administrator. Reference: abc123def456. \
+                    Thank you for your patience.";
         for code in [400u16, 404, 500, 502, 503] {
             let fetch = FetchResult {
                 url: "https://x".into(),
                 final_url: "https://x".into(),
                 status_code: code,
-                html: "<html><body>err</body></html>".into(),
+                html: format!("<html><body><p>{body}</p></body></html>"),
                 headers: Default::default(),
             };
             assert!(

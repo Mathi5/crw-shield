@@ -16,7 +16,7 @@ use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::Page;
-use crw_antibot::stealth_script;
+use crw_antibot::{stealth_script, CookieJar};
 use crw_core::{BrowserAction, CrwError, Result, ScrapeRequest};
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -82,6 +82,8 @@ struct InnerSlot {
 pub struct CdpFetcher {
     config: CdpConfig,
     slot: Arc<Mutex<InnerSlot>>,
+    /// Shared cookie jar — see `HttpFetcher::cookies` for the rationale.
+    cookies: Arc<CookieJar>,
 }
 
 impl CdpFetcher {
@@ -92,11 +94,31 @@ impl CdpFetcher {
                 inner: None,
                 init_attempted: false,
             })),
+            cookies: Arc::new(CookieJar::new()),
         }
     }
 
     pub fn with_default() -> Self {
         Self::new(CdpConfig::default())
+    }
+
+    /// Construct a CDP fetcher that shares a cookie jar with the HTTP fetcher
+    /// (or any other fetcher). Cookies persisted by CDP navigations will be
+    /// re-sent on subsequent HTTP requests, and vice-versa.
+    pub fn with_cookies(config: CdpConfig, cookies: Arc<CookieJar>) -> Self {
+        Self {
+            config,
+            slot: Arc::new(Mutex::new(InnerSlot {
+                inner: None,
+                init_attempted: false,
+            })),
+            cookies,
+        }
+    }
+
+    /// Access the shared cookie jar.
+    pub fn cookies(&self) -> Arc<CookieJar> {
+        self.cookies.clone()
     }
 
     /// Build a `BrowserConfig` matching our settings.
@@ -175,6 +197,36 @@ impl CdpFetcher {
             }
         }
 
+        // Re-inject cookies that the HTTP fetcher (or a previous CDP fetch)
+        // already learned for this host. Setting via `document.cookie` only
+        // works for non-HttpOnly cookies, but it is the simplest path that
+        // does not require a separate CDP round-trip per cookie.
+        if let Some(cookie_header) = self.cookies.cookie_header_for(request.url.as_str()) {
+            // Escape any single quotes in the cookie value so the JS string
+            // literal is safe to evaluate.
+            let escaped = cookie_header.replace('\'', "\\'");
+            let script = format!(
+                r#"(() => {{
+                    const raw = '{escaped}';
+                    const pairs = raw.split(';');
+                    for (const p of pairs) {{
+                        const eq = p.indexOf('=');
+                        if (eq <= 0) continue;
+                        const name = p.slice(0, eq).trim();
+                        const value = p.slice(eq + 1).trim();
+                        if (!name) continue;
+                        try {{
+                            document.cookie = name + '=' + value + '; path=/';
+                        }} catch (e) {{}}
+                    }}
+                }})()"#
+            );
+            let _ = page
+                .evaluate(script)
+                .await
+                .map_err(|e| warn!(error=?e, "failed to inject cookies via document.cookie"));
+        }
+
         // Navigate.
         let page = page
             .goto(url.as_str())
@@ -184,6 +236,13 @@ impl CdpFetcher {
         // Honour wait_for.
         if request.wait_for > 0 {
             tokio::time::sleep(Duration::from_millis(request.wait_for)).await;
+        }
+
+        // Apply realistic timing + mouse micro-movements on e-commerce sites
+        // (and any other site that opts-in via wait_for). This makes the CDP
+        // session look more like a real human browsing the page.
+        if request.wait_for > 0 || is_ecommerce_host(&request.url) {
+            humanise_pre_extract(page).await;
         }
 
         // Run actions. Collect screenshots from screenshot actions.
@@ -206,6 +265,26 @@ impl CdpFetcher {
             .ok()
             .flatten()
             .unwrap_or_else(|| request.url.clone());
+
+        // Persist any cookies the page set during navigation. We read
+        // `document.cookie` and feed each name=value pair into the jar. This
+        // catches first-party cookies only (HttpOnly cookies remain hidden
+        // to JS, which is fine for our use case).
+        if let Ok(final_url_parsed) = Url::parse(&final_url) {
+            if let Some(host) = final_url_parsed.host_str() {
+                if let Ok(value) = page.evaluate("() => document.cookie").await {
+                    if let Ok(cookie_str) = value.into_value::<String>() {
+                        for pair in cookie_str.split(';') {
+                            let pair = pair.trim();
+                            if let Some((name, value)) = pair.split_once('=') {
+                                self.cookies
+                                    .set_cookie(host, name.trim(), value.trim(), None);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let wants_screenshot = request
             .formats
@@ -335,6 +414,82 @@ async fn capture_screenshot(page: &Page, full_page: bool) -> Result<Vec<u8>> {
     page.screenshot(params)
         .await
         .map_err(|e| CrwError::Fetch(format!("screenshot: {e}")))
+}
+
+/// Heuristic: should the CDP fetcher apply the "humanise" pre-extract dance
+/// on this URL? The list of hosts is the short list of e-commerce sites we
+/// tested against. Other sites get a fast, non-mouse path.
+fn is_ecommerce_host(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    const HOSTS: &[&str] = &[
+        "amazon.",
+        "leboncoin.",
+        "fnac.",
+        "cdiscount.",
+        "darty.",
+        "cdiscount.com",
+        "shopify",
+        "aliexpress.",
+        "ebay.",
+    ];
+    HOSTS.iter().any(|needle| lower.contains(needle))
+}
+
+/// Apply a short sequence of small mouse moves and waits to make a CDP
+/// session look slightly more like a human on a slow e-commerce site.
+///
+/// This is *not* a behavioural anti-detect engine on its own — the heavy
+/// lifting is done by the JS stealth script installed before the navigation.
+/// The mouse moves here just add some non-zero event activity, which is
+/// enough to satisfy DataDome and Akamai's "is the page actually being
+/// interacted with?" heuristics on simple static endpoints.
+async fn humanise_pre_extract(page: &Page) {
+    // 1. Wait for `document.readyState === "complete"`. We use a small fixed
+    //    number of polls rather than an event listener because chromiumoxide
+    //    does not expose Page.lifecycleEvent directly.
+    for _ in 0..5 {
+        let ready = page
+            .evaluate("() => document.readyState")
+            .await
+            .ok()
+            .and_then(|v| v.into_value::<String>().ok())
+            .unwrap_or_default();
+        if ready == "complete" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    // 2. Three small mouse moves. We dispatch MouseEvents directly in the
+    //    page because `Input.dispatchMouseEvent` via CDP is more invasive
+    //    (and chromeoxide does not expose it cleanly). The `view: window`
+    //    lets the event travel up to all installed listeners.
+    for (x, y) in [(100u32, 100u32), (300, 200), (500, 350)] {
+        let script = format!(
+            r#"(() => {{
+                try {{
+                    const e = new MouseEvent('mousemove', {{
+                        bubbles: true,
+                        cancelable: true,
+                        clientX: {x},
+                        clientY: {y},
+                        view: window
+                    }});
+                    document.dispatchEvent(e);
+                    window.dispatchEvent(e);
+                }} catch (err) {{}}
+            }})()"#
+        );
+        let _ = page.evaluate(script).await;
+        // 200-400 ms between moves, with a small jitter.
+        let delay_ms = 200 + (fastrand::u64(0..200));
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+
+    // 3. Final settle delay before content extraction. Some DataDome/
+    //    Akamai "is this still a bot?" probes fire ~500 ms after DOMContentLoaded.
+    let settle_ms = 300 + (fastrand::u64(0..200));
+    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
 }
 
 impl Default for CdpFetcher {

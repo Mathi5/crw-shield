@@ -2,12 +2,12 @@
 
 use async_trait::async_trait;
 use crw_antibot::{
-    http_stealth::USER_AGENTS, BrowserProfile, DelayPreset, RequestDelay, StealthHeaders,
-    UserAgentRotator, BROWSER_PROFILES,
+    http_stealth::USER_AGENTS, BrowserProfile, CookieJar, DelayPreset, RequestDelay,
+    StealthHeaders, UserAgentRotator, BROWSER_PROFILES,
 };
 use crw_core::{CrwError, Result, ScrapeRequest};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
@@ -33,10 +33,29 @@ pub struct HttpFetcher {
     ua_rotator: Mutex<UserAgentRotator>,
     delay: RequestDelay,
     stealth_enabled: bool,
+    cookies: Arc<CookieJar>,
 }
 
 impl HttpFetcher {
     pub fn new(timeout_ms: u32, stealth_enabled: bool, preset: DelayPreset) -> Result<Self> {
+        Self::with_cookies(
+            timeout_ms,
+            stealth_enabled,
+            preset,
+            Arc::new(CookieJar::new()),
+        )
+    }
+
+    /// Construct an `HttpFetcher` that shares a cookie jar with other
+    /// fetchers (typically `CdpFetcher`). Cookies returned by the upstream
+    /// site are written into the jar on every response; cookies in the jar
+    /// are attached as a `Cookie:` header on every outgoing request.
+    pub fn with_cookies(
+        timeout_ms: u32,
+        stealth_enabled: bool,
+        preset: DelayPreset,
+        cookies: Arc<CookieJar>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms as u64))
             .user_agent(USER_AGENTS[0])
@@ -47,6 +66,7 @@ impl HttpFetcher {
             ua_rotator: Mutex::new(UserAgentRotator::new()),
             delay: RequestDelay::new(preset),
             stealth_enabled,
+            cookies,
         })
     }
 
@@ -60,7 +80,29 @@ impl HttpFetcher {
             ua_rotator: Mutex::new(UserAgentRotator::new()),
             delay: RequestDelay::new(preset),
             stealth_enabled,
+            cookies: Arc::new(CookieJar::new()),
         }
+    }
+
+    /// Like `with_client` but uses a caller-supplied cookie jar.
+    pub fn with_client_and_cookies(
+        client: reqwest::Client,
+        stealth_enabled: bool,
+        preset: DelayPreset,
+        cookies: Arc<CookieJar>,
+    ) -> Self {
+        Self {
+            client,
+            ua_rotator: Mutex::new(UserAgentRotator::new()),
+            delay: RequestDelay::new(preset),
+            stealth_enabled,
+            cookies,
+        }
+    }
+
+    /// Access the cookie jar (used by tests).
+    pub fn cookies(&self) -> Arc<CookieJar> {
+        self.cookies.clone()
     }
 
     fn pick_profile(&self) -> BrowserProfile {
@@ -108,6 +150,12 @@ impl Fetcher for HttpFetcher {
         for (k, v) in stealth.as_pairs() {
             req = req.header(k, v);
         }
+        // Attach cookies from the shared jar so DataDome `dd`, Amazon
+        // `session-id` / `x-amz-rid`, Cloudflare `cf_clearance`, etc.
+        // round-trip across requests.
+        if let Some(cookie_header) = self.cookies.cookie_header_for(request.url.as_str()) {
+            req = req.header("Cookie", cookie_header);
+        }
         if request.skip_tls_verification {
             tracing::warn!(
                 "skip_tls_verification requested but reqwest client was built with verification on"
@@ -133,6 +181,18 @@ impl Fetcher for HttpFetcher {
         let mut response_headers: HashMap<String, String> = HashMap::new();
         for (k, v) in response.headers().iter() {
             response_headers.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
+        }
+        // Persist any cookies the server returned. `Set-Cookie` is the only
+        // header reqwest gives us verbatim in `headers()` — multiple
+        // Set-Cookie headers appear as multiple values.
+        let host_for_cookies = Url::parse(&final_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| request.url.clone());
+        for value in response.headers().get_all("set-cookie").iter() {
+            if let Ok(s) = value.to_str() {
+                self.cookies.set_from_set_cookie(&host_for_cookies, s);
+            }
         }
         let html = response
             .text()

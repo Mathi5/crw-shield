@@ -45,7 +45,12 @@ async fn scrape_endpoint_returns_markdown() {
 
     let url = format!("{}/page", server.url());
 
-    let state = AppState::from_config(Config::default());
+    let cfg = Config {
+        cdp_enabled: false,
+        flaresolverr_url: None,
+        ..Config::default()
+    };
+    let state = AppState::from_config(cfg);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -116,7 +121,12 @@ async fn scrape_with_links_format_extracts_links() {
         .await;
 
     let url = format!("{}/p", server.url());
-    let state = AppState::from_config(Config::default());
+    let cfg = Config {
+        cdp_enabled: false,
+        flaresolverr_url: None,
+        ..Config::default()
+    };
+    let state = AppState::from_config(cfg);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -225,13 +235,15 @@ async fn auth_token_enforced_when_set() {
         .mock("GET", "/p")
         .with_status(200)
         .with_header("content-type", "text/html")
-        .with_body("<html><body>x</body></html>")
+        .with_body("<html><body><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam.</p></body></html>")
         .create_async()
         .await;
 
     let url = format!("{}/p", server.url());
     let cfg = Config {
         auth_token: Some("secret-token".to_string()),
+        cdp_enabled: false,
+        flaresolverr_url: None,
         ..Config::default()
     };
     let state = AppState::from_config(cfg);

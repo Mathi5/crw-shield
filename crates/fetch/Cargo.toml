@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 chromiumoxide = { workspace = true }
 futures = { workspace = true }
 base64 = "0.22"
+fastrand = "2"
 
 [dev-dependencies]
 mockito = { workspace = true }

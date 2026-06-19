@@ -157,9 +157,9 @@ impl FlareSolverrClient {
             return Err(CrwError::Fetch(format!("flaresolverr error: {msg}")));
         }
 
-        let solution = parsed.solution.ok_or_else(|| {
-            CrwError::Fetch("flaresolverr response missing solution".to_string())
-        })?;
+        let solution = parsed
+            .solution
+            .ok_or_else(|| CrwError::Fetch("flaresolverr response missing solution".to_string()))?;
 
         let html = solution.response.unwrap_or_default();
         let final_url = solution.url;

@@ -464,6 +464,7 @@ dependencies = [
  "chromiumoxide",
  "crw-antibot",
  "crw-core",
+ "fastrand",
  "futures",
  "mockito",
  "reqwest 0.12.28",
