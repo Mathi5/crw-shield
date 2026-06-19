@@ -1,0 +1,451 @@
+# crw-shield anti-bot provider signatures
+# Source: distilled from microlinkhq/is-antibot (MIT), VeNoMouS/cloudscraper,
+# krakeninferno/is-antibot, and observed production behavior in 2025-2026.
+#
+# Format:
+#   [providers.<name>]
+#   kind = "challenge" | "captcha" | "captcha-invisible" | "waf" | "rate-limit" | "login-wall" | "soft-block"
+#   # Tokens that, when found in HTML (case-insensitive), indicate this provider.
+#   # The detector picks the provider with the most token matches.
+#   tokens = ["...", "..."]
+#   # Optional HTTP status codes that, by themselves (without HTML evidence), suggest this provider.
+#   status_codes = [403, 503]
+#   # Optional headers that, when present, indicate this provider.
+#   headers = ["cf-ray", "x-akamai-*"]
+#   # Suggested ladder step if this situation is detected.
+#   suggested_ladder = "cdp" | "flaresolverr" | "none" | "retry-with-delay"
+#   # Free-form notes for the operator.
+#   notes = "..."
+
+# --- Cloudflare ---
+[providers.cloudflare_iuam]
+kind = "challenge"
+tokens = [
+    "challenges.cloudflare.com",
+    "cf-chl-bypass",
+    "__cf_chl_jschl_tk__",
+    "cf-mitigated",
+    "ray id",
+    "cf_chl_prog",
+    "__cf_chl_jschl_tk__",
+    "/cdn-cgi/challenge-platform/",
+    "cloudflare-static",
+    "cf_chl_seq",
+    "turnstile-v0",
+]
+status_codes = [403, 503, 520, 521, 522, 523, 524]
+headers = ["cf-ray", "cf-mitigated"]
+suggested_ladder = "cdp"
+notes = "JS challenge with browser-side jschl token. CDP almost always solves; FlareSolverr as fallback."
+
+[providers.cloudflare_turnstile]
+kind = "captcha-invisible"
+tokens = [
+    "challenges.cloudflare.com/turnstile",
+    "cf-turnstile",
+    "cf-turnstile-script",
+    "turnstile.render",
+]
+status_codes = [403]
+headers = ["cf-ray"]
+suggested_ladder = "cdp"
+notes = "Invisible captcha. CDP with stealth solves; FlareSolverr solves; manual reCAPTCHA fallback."
+
+# --- DataDome ---
+[providers.datadome_captcha]
+kind = "captcha"
+tokens = [
+    "datadome.co",
+    "dd-captcha",
+    "ddc-captcha",
+    "geo.captcha-delivery",
+    "captcha-delivery.com",
+    "datadome-captcha",
+    "dd_",
+    "interstitial-captcha",
+    "datadome-protected",
+]
+status_codes = [403]
+headers = ["x-dd-b", "x-datadome", "server"]
+suggested_ladder = "flaresolverr"
+notes = "Heavy JS challenge + device fingerprinting. TLS fingerprint is critical. FlareSolverr beats CDP."
+
+# --- Akamai Bot Manager ---
+[providers.akamai_bot_manager]
+kind = "challenge"
+tokens = [
+    "akamai",
+    "x-amz-rid",
+    "akamai-bm",
+    "_bmr_",
+    "bm-verify",
+    "akamai/abot",
+    "pm_akamai",
+    "ghostbox-akamai",
+    "akamai-bm-sc",
+    "akamai challenge",
+]
+status_codes = [403]
+headers = ["x-akamai-*", "x-amz-cf-id", "akamai-grn"]
+suggested_ladder = "cdp"
+notes = "Heavy fingerprinting + sensor data. TLS fingerprint and CDP stealth required; FlareSolverr often falls back."
+
+# --- Imperva / Incapsula ---
+[providers.imperva_incapsula]
+kind = "waf"
+tokens = [
+    "incapsula",
+    "_incapsula_resource",
+    "imperva",
+    "incap_ses_",
+    "visid_incap_",
+    "reese84",
+    "pardon our interruption",
+    "you have been blocked",
+]
+status_codes = [403]
+headers = ["x-iinfo", "x-cdn", "incap-ses"]
+suggested_ladder = "cdp"
+notes = "WAF. CDP can solve; FlareSolverr works on most sites."
+
+# --- PerimeterX (now HUMAN) ---
+[providers.perimeterx]
+kind = "captcha"
+tokens = [
+    "perimeterx",
+    "px-captcha",
+    "px-app",
+    "px-cdn",
+    "px-client",
+    "_pxAppId",
+    "pxCaptcha",
+    "humansecurity",
+]
+status_codes = [403]
+headers = ["x-px-*", "px-v"]
+suggested_ladder = "flaresolverr"
+notes = "JS challenge + captcha. FlareSolverr more reliable than CDP for many sites."
+
+# --- reCAPTCHA ---
+[providers.recaptcha]
+kind = "captcha"
+tokens = [
+    "recaptcha",
+    "grecaptcha",
+    "google.com/recaptcha",
+    "rc-captcha",
+    "grecaptcha.render",
+]
+status_codes = []
+headers = []
+suggested_ladder = "cdp"
+notes = "Google captcha. CDP with stealth solves; FlareSolverr works; manual solve otherwise."
+
+# --- hCaptcha ---
+[providers.hcaptcha]
+kind = "captcha"
+tokens = [
+    "hcaptcha.com",
+    "h-captcha",
+    "hcaptcha-iframe",
+    "hcaptcha-challenge",
+]
+status_codes = []
+headers = []
+suggested_ladder = "cdp"
+notes = "Captcha. CDP with stealth solves; FlareSolverr works."
+
+# --- AWS WAF ---
+[providers.aws_waf]
+kind = "waf"
+tokens = [
+    "aws-waf",
+    "aws waf",
+    "x-amz-waf",
+    "awselb",
+    "request rejected",
+    "this request was blocked",
+]
+status_codes = [403]
+headers = ["x-amzn-requestid", "x-amz-waf-*"]
+suggested_ladder = "cdp"
+notes = "AWS WAF. CDP solves; FlareSolverr works on most sites."
+
+# --- Shape Security (F5) ---
+[providers.shape_security]
+kind = "challenge"
+tokens = [
+    "shape security",
+    "f5-shape",
+    "shape-securit",
+    "shap-sec",
+    "x-shape-id",
+    "request blocked",
+]
+status_codes = [403]
+headers = ["x-shape-*"]
+suggested_ladder = "cdp"
+notes = "Heavy fingerprinting. CDP required; FlareSolverr fallback."
+
+# --- Kasada ---
+[providers.kasada]
+kind = "challenge"
+tokens = [
+    "kasada",
+    "kpsdk",
+    "x-kpsdk-*",
+    "kasada-akamai",
+    "itrv3",
+]
+status_codes = [403]
+headers = ["x-kpsdk-ct", "x-kpsdk-v"]
+suggested_ladder = "flaresolverr"
+notes = "Browser-side challenge. FlareSolverr more reliable than CDP for many sites."
+
+# --- FingerprintJS / generic device fingerprint ---
+[providers.generic_fingerprint]
+kind = "waf"
+tokens = [
+    "fingerprint",
+    "fpjs",
+    "fp-",
+    "browser-fingerprint",
+    "device-fingerprint",
+]
+status_codes = []
+headers = []
+suggested_ladder = "cdp"
+notes = "Generic device fingerprinting. Stealth headers and CDP solve."
+
+# --- Distil Networks ---
+[providers.distil]
+kind = "waf"
+tokens = [
+    "distil",
+    "distilnetworks",
+    "distl.cs",
+    "distl-rs",
+]
+status_codes = [403]
+headers = ["x-distil-*"]
+suggested_ladder = "cdp"
+notes = "Bot detection WAF. CDP solves."
+
+# --- Reblaze ---
+[providers.reblaze]
+kind = "waf"
+tokens = [
+    "reblaze",
+    "rbzid",
+    "rbzuid",
+    "reblaze-",
+]
+status_codes = [403]
+headers = ["x-rbz-*"]
+suggested_ladder = "cdp"
+notes = "WAF. CDP solves."
+
+# --- Yandex SmartCaptcha ---
+[providers.yandex_smartcaptcha]
+kind = "captcha"
+tokens = [
+    "smartcaptcha",
+    "yandex smartcaptcha",
+    "captcha.yandex",
+]
+status_codes = []
+headers = []
+suggested_ladder = "cdp"
+notes = "Russian-origin captcha. CDP solves; FlareSolverr works."
+
+# --- Generic rate limit ---
+[providers.generic_rate_limit]
+kind = "rate-limit"
+tokens = [
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "slow down",
+    "request throttled",
+]
+status_codes = [429]
+headers = ["retry-after", "x-ratelimit-*"]
+suggested_ladder = "retry-with-delay"
+notes = "Back off and retry. Use cookies / different IP / different UA."
+
+# --- Geo-block ---
+[providers.geo_block]
+kind = "soft-block"
+tokens = [
+    "not available in your country",
+    "not available in your region",
+    "geo-blocked",
+    "geo restricted",
+    "your region",
+    "country not supported",
+]
+status_codes = [403, 451]
+headers = []
+suggested_ladder = "none"
+notes = "Bypass requires proxy/VPN from allowed region. No software ladder step can solve."
+
+# --- Login wall ---
+[providers.login_wall]
+kind = "login-wall"
+tokens = [
+    "sign in to continue",
+    "log in to continue",
+    "please log in",
+    "login required",
+    "create an account to continue",
+    "members only",
+    "subscribe to read",
+    "paywall",
+]
+status_codes = [401, 402, 403]
+headers = []
+suggested_ladder = "cdp"
+notes = "Auth wall. CDP + user-supplied session cookies may help."
+
+# --- Soft 404 (Amazon, ...) ---
+[providers.soft_404]
+kind = "soft-block"
+tokens = [
+    "page not found",
+    "sorry, we just need to make sure you're not a robot",
+    "no longer available",
+    "this product is unavailable",
+    "amazon page not found",
+    "page does not exist",
+    "looks like you've reached a dead end",
+]
+status_codes = [404, 410]
+headers = []
+suggested_ladder = "none"
+notes = "Real 404, no bot block. Return as-is; ladder has nothing to do."
+
+# --- Generic 'access denied' ---
+[providers.generic_access_denied]
+kind = "waf"
+tokens = [
+    "access denied",
+    "access denied (403)",
+    "forbidden",
+    "request forbidden",
+    "you don't have permission to access",
+]
+status_codes = [403]
+headers = []
+suggested_ladder = "cdp"
+notes = "Generic 403. Try CDP/FlareSolverr. May be IP-based or geo-based."
+
+# --- Generic 'please verify' ---
+[providers.generic_verify]
+kind = "challenge"
+tokens = [
+    "please verify you are a human",
+    "verifying you are human",
+    "verifying that you are human",
+    "performing security verification",
+    "security verification",
+    "attention required",
+    "checking your browser before accessing",
+    "ddc-captcha",
+]
+status_codes = [403]
+headers = []
+suggested_ladder = "cdp"
+notes = "Generic human-verification page. CDP solves most."
+
+# --- JS-only (SPA, no SSR) ---
+[providers.js_only]
+kind = "soft-block"
+tokens = [
+    "react-root",
+    "noscript",
+    "enable javascript",
+    "this site requires javascript",
+    "next/static",
+    "nuxt/",
+    "__nuxt",
+    "data-reactroot",
+    "ng-version",
+    "app-root",
+]
+status_codes = [200]
+headers = []
+suggested_ladder = "cdp"
+notes = "Client-rendered SPA. HTTP fetcher returns shell; CDP renders real content."
+
+# --- Friendly Captcha ---
+[providers.friendly_captcha]
+kind = "captcha-invisible"
+tokens = [
+    "friendlycaptcha",
+    "frc-captcha",
+]
+status_codes = []
+headers = []
+suggested_ladder = "cdp"
+notes = "Invisible captcha. CDP solves."
+
+# --- GeeTest ---
+[providers.geetest]
+kind = "captcha"
+tokens = [
+    "geetest",
+    "gt.js",
+    "geetest_",
+]
+status_codes = []
+headers = []
+suggested_ladder = "cdp"
+notes = "Captcha. CDP solves; FlareSolverr works."
+
+# --- FunCaptcha (Arkose Labs) ---
+[providers.funcaptcha]
+kind = "captcha"
+tokens = [
+    "funcaptcha",
+    "arkoselabs",
+    "arkose",
+]
+status_codes = []
+headers = []
+suggested_ladder = "cdp"
+notes = "Hard captcha. FlareSolverr required for many sites."
+
+# --- Generic CDN block ---
+[providers.generic_cdn_block]
+kind = "waf"
+tokens = [
+    "your request has been blocked",
+    "your request was blocked",
+    "request has been denied",
+    "blocked by firewall",
+    "blocked by security",
+    "blocked by cdn",
+    "edge security",
+    "edge firewall",
+    "denied by policy",
+]
+status_codes = [403, 503]
+headers = []
+suggested_ladder = "cdp"
+notes = "Generic WAF/CDN block. Try CDP first."
+
+# --- Generic 5xx server-side block ---
+[providers.server_error]
+kind = "soft-block"
+tokens = [
+    "service unavailable",
+    "temporarily unavailable",
+    "server error",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+]
+status_codes = [500, 502, 503, 504]
+headers = []
+suggested_ladder = "retry-with-delay"
+notes = "Server-side issue, not bot detection. Retry with delay; surface as 5xx error if persistent."

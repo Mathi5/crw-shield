@@ -6,9 +6,14 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-crw-core = { path = "../core" }
+# No `crw-core` dependency: antibot is a leaf crate (only types, no I/O).
+# The reverse dependency `crw-core -> crw-antibot` is what carries the
+# `SituationReport` data type into `ScrapeMetadata`. See core/Cargo.toml.
 rand = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
 once_cell = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"

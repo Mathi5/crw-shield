@@ -61,6 +61,7 @@ async fn handle_scrape(
         .map_err(|e| ErrorResponse::new(e.code(), e.to_string()))?;
 
     let fetch_result = ladder_result.fetch;
+    let situation = ladder_result.situation;
 
     if !state.config.cdp_enabled {
         if let Some(challenge) = detect_challenge(&fetch_result.html) {
@@ -98,6 +99,7 @@ async fn handle_scrape(
     let metadata = ScrapeMetadata {
         extraction_quality,
         page_type,
+        situation: Some(situation),
         ..metadata
     };
 

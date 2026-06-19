@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use crw_antibot::situation::SituationReport;
 use serde::{Deserialize, Serialize};
 
 fn default_formats() -> Vec<Format> {
@@ -202,6 +203,11 @@ pub struct ScrapeMetadata {
     /// | "forum" | "doc" | "unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_type: Option<String>,
+    /// Phase B: structured diagnosis of the HTTP response — provider name,
+    /// suggested ladder step, and the evidence that triggered the
+    /// detection. Optional so existing serialised payloads still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub situation: Option<SituationReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

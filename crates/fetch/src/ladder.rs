@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use crw_antibot::{detect_challenge, detect_empty_or_blocked, CookieJar};
+use crw_antibot::{
+    detect_empty_or_blocked, diagnose_situation, CookieJar, SituationReport, SuggestedLadder,
+};
 use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, ScrapeResponse};
 use tracing::{debug, warn};
 
@@ -49,6 +51,10 @@ pub struct LadderResult {
     pub fetch: FetchResult,
     pub screenshot: Option<Vec<u8>>,
     pub source: FetchSource,
+    /// Structured diagnosis of the HTTP response, when one was produced.
+    /// The ladder populates this whenever it ran the HTTP fetcher; the
+    /// FlareSolverr / CDP-only paths leave it as a default `CleanSuccess`.
+    pub situation: SituationReport,
 }
 
 /// Composite fetcher that owns an HTTP fetcher plus an optional CDP fetcher
@@ -133,26 +139,37 @@ impl FetchLadder {
         false
     }
 
-    /// Decide whether the HTTP response is a challenge page and should be
-    /// escalated to CDP. We treat both obvious challenge HTML (Cloudflare,
-    /// hCaptcha, ...) and suspicious anti-bot status codes (403, 429) as
-    /// triggers so we can fall back to a real browser. We also escalate when
-    /// the response is suspiciously small (< 500 chars) or matches one of the
-    /// known "empty/anti-bot" markers (Amazon 404, DataDome block, ...).
-    fn http_is_challenge(fetch: &FetchResult) -> bool {
-        if matches!(fetch.status_code, 403 | 429) {
+    /// Run the structured situation detector over a `FetchResult`. Returns
+    /// the full `SituationReport` so the ladder can act on
+    /// `suggested_ladder` rather than a binary "is challenge?" flag.
+    fn diagnose_fetch(fetch: &FetchResult) -> SituationReport {
+        let header_pairs: Vec<(String, String)> = fetch
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let headers_opt: Option<&[(String, String)]> = if header_pairs.is_empty() {
+            None
+        } else {
+            Some(&header_pairs)
+        };
+        diagnose_situation(&fetch.html, Some(fetch.status_code), headers_opt)
+    }
+
+    /// Decide whether the HTTP response should be escalated. We rely on the
+    /// structured `SituationReport` instead of the legacy boolean helpers:
+    /// `suggested_ladder` tells us exactly which step to take next (or that
+    /// we should stay put). We also fall back to the legacy
+    /// `detect_empty_or_blocked` heuristic for the small-payload case the
+    /// detector doesn't classify itself.
+    fn http_should_escalate(fetch: &FetchResult) -> bool {
+        let report = Self::diagnose_fetch(fetch);
+        if report.should_escalate() {
             return true;
         }
-        if detect_challenge(&fetch.html).is_some() {
-            return true;
-        }
-        // For non-200/2xx responses, treat small/blocked HTML as challenge.
-        // For 2xx, a small page is legitimate (e.g. status pages).
-        if !(200..300).contains(&fetch.status_code) {
-            return detect_empty_or_blocked(&fetch.html);
-        }
-        // 2xx but still has anti-bot markers (DataDome etc.)
-        detect_challenge(&fetch.html).is_some() || detect_empty_or_blocked(&fetch.html)
+        // Belt-and-suspenders: if the detector returned CleanSuccess but the
+        // body is suspiciously small / shaped, escalate anyway.
+        detect_empty_or_blocked(&fetch.html)
     }
 
     /// Decide whether a CDP-rendered page is still an "empty / anti-bot"
@@ -213,6 +230,7 @@ impl FetchLadder {
                     } else {
                         FetchSource::FlareSolverr
                     },
+                    situation: SituationReport::default(),
                 }))
             }
             Err(e) => {
@@ -230,14 +248,18 @@ impl FetchLadder {
         if !force_cdp {
             match self.try_http(request).await {
                 Ok(fetch) => {
-                    if !Self::http_is_challenge(&fetch) {
+                    let situation = Self::diagnose_fetch(&fetch);
+                    if !Self::http_should_escalate(&fetch) {
                         return Ok(LadderResult {
                             fetch,
                             screenshot: None,
                             source: FetchSource::Http,
+                            situation,
                         });
                     }
-                    warn!(url = %request.url, "HTTP response looks like a challenge; escalating to CDP");
+                    // Escalate per the situation's suggestion.
+                    let suggestion = situation.suggested_ladder;
+                    warn!(url = %request.url, situation = %situation.kind, ?suggestion, "HTTP response triggers escalation");
                     // fall through to CDP
                     if self.cdp.is_some() {
                         match self.try_cdp(request).await {
@@ -265,6 +287,7 @@ impl FetchLadder {
                                     },
                                     screenshot: cdp_res.screenshot,
                                     source: FetchSource::HttpChallengeThenCdp,
+                                    situation,
                                 });
                             }
                             Err(e) => {
@@ -278,6 +301,7 @@ impl FetchLadder {
                                     fetch,
                                     screenshot: None,
                                     source: FetchSource::Http,
+                                    situation,
                                 });
                             }
                         }
@@ -294,6 +318,7 @@ impl FetchLadder {
                         fetch,
                         screenshot: None,
                         source: FetchSource::Http,
+                        situation,
                     });
                 }
                 Err(e) => {
@@ -319,6 +344,7 @@ impl FetchLadder {
                             },
                             screenshot: cdp_res.screenshot,
                             source: FetchSource::Cdp,
+                            situation: SituationReport::default(),
                         });
                     }
                     return Err(e);
@@ -328,7 +354,22 @@ impl FetchLadder {
 
         // Force CDP path.
         let cdp_res = self.try_cdp(request).await?;
-        if detect_challenge(&cdp_res.html).is_some() {
+        // Run the detector on the CDP-rendered HTML so the report reflects
+        // the final, JS-rendered page (a fully-rendered Cloudflare IUAM
+        // interstitial would now classify as CleanSuccess).
+        let situation = Self::diagnose_fetch(&FetchResult {
+            url: cdp_res.url.clone(),
+            final_url: cdp_res.final_url.clone(),
+            status_code: cdp_res.status_code,
+            html: cdp_res.html.clone(),
+            headers: cdp_res.headers.clone(),
+        });
+        // Smart escalation: if the situation still suggests FlareSolverr
+        // (e.g. DataDome) we should NOT return the CDP result, we should
+        // jump to the right backend. The legacy code only escalated on
+        // `detect_challenge` which was never true post-CDP — a real bug
+        // that Phase B fixes.
+        if matches!(situation.suggested_ladder, SuggestedLadder::FlareSolverr) {
             if let Some(fs_result) = self.try_flaresolverr(&request.url, request, true).await? {
                 return Ok(fs_result);
             }
@@ -343,6 +384,7 @@ impl FetchLadder {
             },
             screenshot: cdp_res.screenshot,
             source: FetchSource::Cdp,
+            situation,
         })
     }
 }
@@ -465,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn http_is_challenge_detects_cloudflare() {
+    fn http_should_escalate_detects_cloudflare() {
         let fetch = FetchResult {
             url: "https://x".into(),
             final_url: "https://x".into(),
@@ -473,11 +515,11 @@ mod tests {
             html: "<html><script src='https://challenges.cloudflare.com/'></script></html>".into(),
             headers: Default::default(),
         };
-        assert!(FetchLadder::http_is_challenge(&fetch));
+        assert!(FetchLadder::http_should_escalate(&fetch));
     }
 
     #[test]
-    fn http_is_challenge_returns_false_for_clean() {
+    fn http_should_escalate_returns_false_for_clean() {
         let body = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
                     Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. \
                     Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris \
@@ -492,11 +534,11 @@ mod tests {
             html: format!("<html><body><p>{body}</p></body></html>"),
             headers: Default::default(),
         };
-        assert!(!FetchLadder::http_is_challenge(&fetch));
+        assert!(!FetchLadder::http_should_escalate(&fetch));
     }
 
     #[test]
-    fn http_is_challenge_detects_403() {
+    fn http_should_escalate_detects_403() {
         let fetch = FetchResult {
             url: "https://x".into(),
             final_url: "https://x".into(),
@@ -504,11 +546,11 @@ mod tests {
             html: "<html><body>Forbidden</body></html>".into(),
             headers: Default::default(),
         };
-        assert!(FetchLadder::http_is_challenge(&fetch));
+        assert!(FetchLadder::http_should_escalate(&fetch));
     }
 
     #[test]
-    fn http_is_challenge_detects_429() {
+    fn http_should_escalate_detects_429() {
         let fetch = FetchResult {
             url: "https://x".into(),
             final_url: "https://x".into(),
@@ -516,16 +558,18 @@ mod tests {
             html: "<html><body>Too Many Requests</body></html>".into(),
             headers: Default::default(),
         };
-        assert!(FetchLadder::http_is_challenge(&fetch));
+        assert!(FetchLadder::http_should_escalate(&fetch));
     }
 
     #[test]
-    fn http_is_challenge_ignores_other_error_codes() {
+    fn http_should_escalate_ignores_4xx_other_than_403_429() {
+        // Phase B: 5xx codes now DO trigger escalation (ServerError
+        // suggests RetryWithDelay). This test only covers 4xx.
         let body = "Not Found - the requested resource does not exist on this server. \
                     Please check the URL and try again. If you believe this is an error, \
                     contact the site administrator. Reference: abc123def456. \
                     Thank you for your patience.";
-        for code in [400u16, 404, 500, 502, 503] {
+        for code in [400u16, 404] {
             let fetch = FetchResult {
                 url: "https://x".into(),
                 final_url: "https://x".into(),
@@ -534,10 +578,58 @@ mod tests {
                 headers: Default::default(),
             };
             assert!(
-                !FetchLadder::http_is_challenge(&fetch),
-                "expected code {code} not to be treated as challenge"
+                !FetchLadder::http_should_escalate(&fetch),
+                "expected code {code} not to trigger escalation"
             );
         }
+    }
+
+    #[test]
+    fn http_should_escalate_on_5xx_via_server_error_situation() {
+        let fetch = FetchResult {
+            url: "https://x".into(),
+            final_url: "https://x".into(),
+            status_code: 500,
+            html: "<html><body>Internal Server Error</body></html>".into(),
+            headers: Default::default(),
+        };
+        let report = FetchLadder::diagnose_fetch(&fetch);
+        assert_eq!(report.kind, crw_antibot::SituationKind::ServerError);
+        assert!(FetchLadder::http_should_escalate(&fetch));
+    }
+
+    #[test]
+    fn diagnose_fetch_returns_situation_report_with_suggested_ladder() {
+        // Akamai Bot Manager: should suggest CDP via the X-Akamai-Transformed header.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-akamai-transformed".to_string(), "9 9 9".to_string());
+        let fetch = FetchResult {
+            url: "https://x".into(),
+            final_url: "https://x".into(),
+            status_code: 403,
+            html: "<html></html>".into(),
+            headers,
+        };
+        let report = FetchLadder::diagnose_fetch(&fetch);
+        assert_eq!(report.kind, crw_antibot::SituationKind::AkamaiBotManager);
+        assert_eq!(report.suggested_ladder, crw_antibot::SuggestedLadder::Cdp);
+    }
+
+    #[test]
+    fn diagnose_fetch_detects_data_dome_suggests_flaresolverr() {
+        let fetch = FetchResult {
+            url: "https://x".into(),
+            final_url: "https://x".into(),
+            status_code: 403,
+            html: "<html><body><div class='ddc-captcha'>x</div></body></html>".into(),
+            headers: Default::default(),
+        };
+        let report = FetchLadder::diagnose_fetch(&fetch);
+        assert_eq!(report.kind, crw_antibot::SituationKind::DataDomeCaptcha);
+        assert_eq!(
+            report.suggested_ladder,
+            crw_antibot::SuggestedLadder::FlareSolverr
+        );
     }
 
     #[tokio::test]
@@ -579,6 +671,7 @@ mod tests {
             fetch,
             screenshot: Some(vec![0x89, b'P', b'N', b'G', 0, 0, 0, 0]),
             source: FetchSource::Cdp,
+            situation: SituationReport::default(),
         };
         let data = scrape_data_from_ladder(&r);
         assert!(data

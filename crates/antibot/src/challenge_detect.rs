@@ -2,29 +2,30 @@
 //!
 //! In Phase 1 we only detect (so the scrape can fail gracefully); bypass /
 //! rendering through CDP happens in Phase 2.
+//!
+//! **Phase B**: this module is now a thin compatibility shim over the
+//! structured `situation::diagnose` function. New code should call
+//! `situation::diagnose` directly to get a full `SituationReport` with
+//! evidence and a suggested ladder step. The old `detect_challenge` /
+//! `detect_empty_or_blocked` functions are kept so that ladder.rs (and
+//! other callers) don't need to change immediately.
 
-/// Returns the name of the challenge provider when one is detected, `None` otherwise.
+use crate::situation::{diagnose, SituationKind};
+
+/// Returns the human-readable name of the detected challenge provider, or
+/// `None` if no anti-bot fingerprint is found in the HTML. The set of
+/// recognised names has been extended in Phase B but the return type is
+/// unchanged for backward compatibility.
 pub fn detect_challenge(html: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    if lower.contains("challenges.cloudflare.com")
-        || lower.contains("cf-chl-bypass")
-        || lower.contains("__cf_chl_jschl_tk__")
-    {
-        return Some("Cloudflare".to_string());
+    let report = diagnose(html, None, None);
+    if report.is_anti_bot() {
+        // Map back to the legacy provider names so existing logs / tests
+        // keep working. New `data-*` attributes in API output use
+        // `kind.as_str()` directly.
+        Some(report.kind.as_str().to_string())
+    } else {
+        None
     }
-    if lower.contains("hcaptcha.com") || lower.contains("h-captcha") {
-        return Some("hCaptcha".to_string());
-    }
-    if lower.contains("recaptcha") || lower.contains("grecaptcha") {
-        return Some("reCAPTCHA".to_string());
-    }
-    if lower.contains("perimeterx") || lower.contains("px-captcha") {
-        return Some("PerimeterX".to_string());
-    }
-    if lower.contains("datadome.co") || lower.contains("dd-captcha") {
-        return Some("DataDome".to_string());
-    }
-    None
 }
 
 /// Returns `true` when the HTML body looks like a "blocked but undetected" page —
@@ -33,74 +34,14 @@ pub fn detect_challenge(html: &str) -> Option<String> {
 /// CDP / FlareSolverr should take over even when `detect_challenge` returned
 /// `None`.
 pub fn detect_empty_or_blocked(html: &str) -> bool {
-    let trimmed = html.trim();
-    let len = trimmed.len();
-
-    // 1. Suspiciously small payloads (< 200 chars after trim). Real pages are
-    //    always larger, even tiny single-product pages. Anti-bot blocks like
-    //    "Access Denied" or empty SPA shells are usually under 200 chars.
-    if len < 200 {
-        return true;
-    }
-
-    // 2. Hard anti-bot landing pages that don't trigger `detect_challenge`.
-    let lower = trimmed.to_ascii_lowercase();
-    const BLOCK_PHRASES: &[&str] = &[
-        "you have been blocked",
-        "access denied",
-        "please verify you are a human",
-        "checking your browser before accessing",
-        "ddc-captcha", // DataDome captcha container
-        "geo.captcha-delivery",
-        "cf-mitigated", // Cloudflare mitigation wrapper
-        "pardon our interruption",
-        "request rejected",
-        "this request was blocked",
-        "bot detection",
-        "incapsula",
-        "_Incapsula_Resource",
-        "akamai",                // Akamai bot manager generic
-        "x-amz-rid",             // Amazon request ID hint
-        "security verification", // StackOverflow Cloudflare
-        "performing security verification",
-        "verifying you are human",
-        "attention required",
-        "ray id", // Cloudflare Ray ID
-        "cf-chl-bypass",
-    ];
-    for phrase in BLOCK_PHRASES {
-        if lower.contains(phrase) {
-            return true;
-        }
-    }
-
-    // 3. JSON-only SPA shells with no rendered DOM content. These are <script>
-    //    tags that bootstrap a React/Next.js page but the body is still empty.
-    //    We measure only the text OUTSIDE of tags (a src= URL inside <script>
-    //    doesn't count as visible content).
-    let has_doctype = lower.starts_with("<!doctype") || lower.starts_with("<html");
-    let body_tag_open = lower.find("<body");
-    if has_doctype && body_tag_open.is_some() {
-        let after_body_start = body_tag_open.unwrap();
-        let body_close = lower[after_body_start..].find("</body>");
-        if let Some(close_offset) = body_close {
-            let body_inner = &lower[after_body_start..after_body_start + close_offset];
-            let tag_count = body_inner.matches('<').count();
-            // Strip all tags from the body and measure what's left.
-            let stripped: String = body_inner
-                .split('<')
-                .filter_map(|s| s.find('>').map(|i| &s[i + 1..]))
-                .collect();
-            let visible_chars: usize = stripped.chars().filter(|c| !c.is_whitespace()).count();
-            // If less than 100 visible chars (outside of tags) and many tags,
-            // it's an empty SPA shell.
-            if visible_chars < 100 && tag_count > 5 {
-                return true;
-            }
-        }
-    }
-
-    false
+    let report = diagnose(html, None, None);
+    matches!(
+        report.kind,
+        SituationKind::JsOnly
+            | SituationKind::ServerError
+            | SituationKind::RateLimited
+            | SituationKind::SoftNotFound
+    ) || (report.kind != SituationKind::CleanSuccess && report.kind.is_anti_bot())
 }
 
 #[cfg(test)]
@@ -111,11 +52,11 @@ mod tests {
     fn detects_cloudflare() {
         assert_eq!(
             detect_challenge("<script src='https://challenges.cloudflare.com/...' ></script>"),
-            Some("Cloudflare".to_string())
+            Some("cloudflare_iuam".to_string())
         );
         assert_eq!(
             detect_challenge("var __cf_chl_jschl_tk__ = 'abc';"),
-            Some("Cloudflare".to_string())
+            Some("cloudflare_iuam".to_string())
         );
     }
 
@@ -123,11 +64,11 @@ mod tests {
     fn detects_hcaptcha() {
         assert_eq!(
             detect_challenge("<div class='h-captcha'></div>"),
-            Some("hCaptcha".to_string())
+            Some("hcaptcha".to_string())
         );
         assert_eq!(
             detect_challenge("https://hcaptcha.com/1/api.js"),
-            Some("hCaptcha".to_string())
+            Some("hcaptcha".to_string())
         );
     }
 
@@ -135,7 +76,7 @@ mod tests {
     fn detects_recaptcha() {
         assert_eq!(
             detect_challenge("grecaptcha.render('container')"),
-            Some("reCAPTCHA".to_string())
+            Some("recaptcha".to_string())
         );
     }
 
@@ -143,7 +84,7 @@ mod tests {
     fn detects_perimeterx() {
         assert_eq!(
             detect_challenge("px-captcha iframe loaded"),
-            Some("PerimeterX".to_string())
+            Some("perimeterx".to_string())
         );
     }
 
@@ -151,7 +92,7 @@ mod tests {
     fn detects_datadome() {
         assert_eq!(
             detect_challenge("datadome.co challenge page"),
-            Some("DataDome".to_string())
+            Some("datadome_captcha".to_string())
         );
     }
 
@@ -164,7 +105,7 @@ mod tests {
     #[test]
     fn case_insensitive() {
         let html = "<HTML><BODY>CHALLENGES.CLOUDFLARE.COM</BODY></HTML>";
-        assert_eq!(detect_challenge(html), Some("Cloudflare".to_string()));
+        assert_eq!(detect_challenge(html), Some("cloudflare_iuam".to_string()));
     }
 
     #[test]
@@ -188,8 +129,6 @@ mod tests {
 
     #[test]
     fn empty_or_blocked_detects_empty_spa_shell() {
-        // SPA shell with 8 script tags but virtually no visible text content.
-        // Body visible chars < 50 with many tags > 5 should be flagged.
         let html = r#"<!DOCTYPE html>
 <html><head><title>App</title></head><body>
 <script src="/_next/static/chunks/main.js"></script>

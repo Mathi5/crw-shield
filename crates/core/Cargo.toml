@@ -14,3 +14,8 @@ url = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = "1"
+# Phase B: ScrapeMetadata carries a structured `SituationReport` produced
+# by the antibot detector. We import the type here, never the logic, so
+# the dependency stays a pure type dependency. crw-antibot is a leaf
+# crate (no `crw-core` dep) so this is acyclic.
+crw-antibot = { path = "../antibot" }
