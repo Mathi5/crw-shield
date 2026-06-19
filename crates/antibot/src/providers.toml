@@ -61,7 +61,6 @@ tokens = [
     "geo.captcha-delivery",
     "captcha-delivery.com",
     "datadome-captcha",
-    "dd_",
     "interstitial-captcha",
     "datadome-protected",
 ]
@@ -74,10 +73,7 @@ notes = "Heavy JS challenge + device fingerprinting. TLS fingerprint is critical
 [providers.akamai_bot_manager]
 kind = "challenge"
 tokens = [
-    "akamai",
-    "x-amz-rid",
     "akamai-bm",
-    "_bmr_",
     "bm-verify",
     "akamai/abot",
     "pm_akamai",

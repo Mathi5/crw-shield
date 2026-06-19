@@ -402,11 +402,17 @@ pub fn diagnose(
     }
 
     // 3. Token-scan the HTML. Score every provider, pick the highest.
+    // Tokens shorter than 4 characters are skipped — they cause too
+    // many false positives (`"dd_"`, `"id_"`, `"js"`, etc. match
+    // legitimate HTML).
     let mut best: Option<(usize, &ProviderEntry, Vec<Evidence>)> = None;
     for entry in providers::all() {
         let mut hits = 0usize;
         let mut ev = Vec::new();
         for token in &entry.tokens_lower {
+            if token.len() < 4 {
+                continue;
+            }
             if let Some(pos) = lower.find(token) {
                 hits += 1;
                 ev.push(Evidence {
