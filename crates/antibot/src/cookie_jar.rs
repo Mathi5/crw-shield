@@ -127,6 +127,11 @@ impl CookieJar {
         guard.cookies.values().map(|b| b.len()).sum()
     }
 
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Parse a `Set-Cookie` header value (just the first line of it — the
     /// spec deals with the value as it appears in HTTP wire format) and store
     /// it in the jar.

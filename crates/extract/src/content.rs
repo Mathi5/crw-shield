@@ -2,6 +2,7 @@
 //! area before downstream markdown conversion.
 
 use scraper::{element_ref::ElementRef, Html, Selector};
+use serde::{Deserialize, Serialize};
 
 const UNWANTED_TAGS: &[&str] = &[
     "script", "style", "noscript", "iframe", "svg", "link", "meta", "title", "head", "nav",
@@ -134,6 +135,48 @@ const NOISE_EXACT_TOKENS: &[&str] = &[
 /// whitespace-split token in its class or id attribute starts with one of
 /// these (case-insensitive).
 const NOISE_PREFIXES: &[&str] = &["ad-", "ads-", "adv-", "sponsor"];
+
+/// Coarse classification of the input HTML. Drives scoring weights and
+/// fallback decisions in [`extract_main_content_v2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageType {
+    /// News article, blog post, Wikipedia entry — long-form prose with one
+    /// dominant `<article>` or `<main>` element.
+    Article,
+    /// E-commerce product page — title, price, description, specs, reviews.
+    Product,
+    /// Index / catalog / search results — many short items, no dominant prose.
+    Listing,
+    /// Forum thread / Q&A — question at top, answers below, votes, comments.
+    Forum,
+    /// API / technical documentation — heavy code blocks, table of contents.
+    Doc,
+    /// Cannot be classified confidently.
+    #[default]
+    Unknown,
+}
+
+/// Result of `extract_main_content_v2`. `markdown` is the actual content,
+/// `quality` is a 0.0..=1.0 confidence score (drives the caller decision:
+/// escalate to CDP/FlareSolverr if low), `page_type` is the coarse
+/// classification, `used_fallback` is true when the permissive path was
+/// taken because the strict path returned too little.
+#[derive(Debug, Clone)]
+pub struct ExtractionResult {
+    pub markdown: String,
+    pub quality: f32,
+    pub page_type: PageType,
+    pub used_fallback: bool,
+}
+
+impl ExtractionResult {
+    /// True when the extraction looks usable: quality above 0.3 and a
+    /// meaningful amount of text.
+    pub fn is_usable(&self) -> bool {
+        self.quality >= 0.3 && self.markdown.len() >= 200
+    }
+}
 
 const CONTENT_SELECTORS: &[&str] = &[
     "#mw-content-text",
@@ -429,6 +472,243 @@ pub fn extract_main_content(html: &str) -> String {
     }
 
     strip_unwanted(&cleaned)
+}
+
+// =========================================================================
+// extract_main_content_v2 — quality scoring + automatic permissive fallback
+// =========================================================================
+//
+// Behaviour mirrors Firecrawl's "If onlyMainContent results in empty markdown,
+// retries with onlyMainContent: false". We compute a quality score for each
+// candidate extraction; if no candidate clears the threshold we automatically
+// fall back to a permissive path (just `strip_unwanted` of `<body>`) and
+// surface that to the caller via `used_fallback: true`.
+
+/// Quality threshold for accepting a strict candidate. Tuned conservatively.
+const QUALITY_THRESHOLD: f32 = 0.3;
+/// Slightly lower threshold for the `largest_text_block` fallback path.
+const QUALITY_THRESHOLD_FALLBACK: f32 = 0.2;
+/// Minimum visible-text length (chars) to consider an extraction non-empty.
+const MIN_TEXT_LEN: usize = 200;
+
+/// Extract main content with quality scoring and automatic fallback.
+///
+/// Pipeline:
+/// 1. **Pre-clean**: run `strip_unwanted` to drop scripts/styles/navs/footers.
+/// 2. **Classify**: pick a `PageType` (Article, Product, Listing, Forum, Doc,
+///    Unknown) based on structural signals.
+/// 3. **Score + select**: try CONTENT_SELECTORS in order. For each candidate,
+///    compute a quality score based on text density, link density, and
+///    structural bonuses. Use the first candidate whose score is above
+///    `QUALITY_THRESHOLD` and whose visible text is at least `MIN_TEXT_LEN`.
+/// 4. **Fallback**: if no candidate passes, retry in permissive mode (just
+///    `strip_unwanted` of `<body>`). Mark `used_fallback = true` and assign a
+///    low quality score (0.05..=0.2) so callers know to escalate.
+/// 5. **Wikipedia tail cut**: drop References/See also/External links tail.
+///
+/// Returns an [`ExtractionResult`] with the cleaned HTML, the confidence
+/// score, the classified page type, and whether the permissive fallback was
+/// used.
+pub fn extract_main_content_v2(html: &str) -> ExtractionResult {
+    let cleaned = strip_unwanted(html);
+    let doc = Html::parse_document(&cleaned);
+
+    let page_type = classify_page_type(&doc);
+
+    // Phase 1 — strict selection.
+    for selector_str in CONTENT_SELECTORS {
+        if let Ok(sel) = Selector::parse(selector_str) {
+            if let Some(el) = doc.select(&sel).next() {
+                let content = if let Some(narrower) = drilldown_block(&doc, el) {
+                    narrower.inner_html()
+                } else {
+                    el.inner_html()
+                };
+                let tailed = strip_wikipedia_tail(&content);
+                let candidate = strip_unwanted(&tailed);
+                let text_len = visible_text_len(&candidate);
+                let quality = score_quality(&candidate, text_len, page_type);
+
+                if quality >= QUALITY_THRESHOLD && text_len >= MIN_TEXT_LEN {
+                    return ExtractionResult {
+                        markdown: candidate,
+                        quality,
+                        page_type,
+                        used_fallback: false,
+                    };
+                }
+            }
+        }
+    }
+
+    // Phase 2 — largest-text-block heuristic.
+    if let Some(block) = largest_text_block(&doc) {
+        let tailed = strip_wikipedia_tail(&block.inner_html());
+        let candidate = strip_unwanted(&tailed);
+        let text_len = visible_text_len(&candidate);
+        let quality = score_quality(&candidate, text_len, page_type);
+
+        if quality >= QUALITY_THRESHOLD_FALLBACK && text_len >= MIN_TEXT_LEN {
+            return ExtractionResult {
+                markdown: candidate,
+                quality,
+                page_type,
+                used_fallback: false,
+            };
+        }
+    }
+
+    // Phase 3 — permissive fallback: strip and return. Quality is low by
+    // design — this path is hit when the page is JS-only or has no clear
+    // main content area. The caller can decide to escalate.
+    if let Ok(body_sel) = Selector::parse("body") {
+        if let Some(body) = doc.select(&body_sel).next() {
+            let tailed = strip_wikipedia_tail(&body.inner_html());
+            let candidate = strip_unwanted(&tailed);
+            let text_len = visible_text_len(&candidate);
+            let quality = if text_len >= MIN_TEXT_LEN { 0.2 } else { 0.05 };
+            return ExtractionResult {
+                markdown: candidate,
+                quality,
+                page_type,
+                used_fallback: true,
+            };
+        }
+    }
+
+    // Phase 4 — absolute last resort.
+    ExtractionResult {
+        markdown: cleaned,
+        quality: 0.0,
+        page_type,
+        used_fallback: true,
+    }
+}
+
+/// Heuristic page-type classification. Looks at the structural signals in
+/// the document and picks the most likely type. Cheap, runs in O(n).
+fn classify_page_type(doc: &Html) -> PageType {
+    let count_sel = |sel_str: &str| -> usize {
+        Selector::parse(sel_str)
+            .map(|s| doc.select(&s).count())
+            .unwrap_or(0)
+    };
+    let article_count = count_sel("article");
+    let h1_count = count_sel("h1");
+    let table_count = count_sel("table");
+    let pre_count = count_sel("pre, code");
+    let ul_ol_count = count_sel("ul, ol");
+    let li_count = count_sel("li");
+
+    // Doc: heavy code/table presence.
+    if pre_count >= 5 || table_count >= 3 {
+        return PageType::Doc;
+    }
+    // Forum/QA: many list items under article.
+    if article_count >= 1 && li_count >= 10 {
+        return PageType::Forum;
+    }
+    // Listing: many list items, no dominant article.
+    if li_count >= 20 && ul_ol_count >= 3 {
+        return PageType::Listing;
+    }
+    // Product: typical product page has price/cart markers.
+    let has_price_marker = doc.tree.root().descendants().any(|n| {
+        n.value()
+            .as_element()
+            .map(|e| {
+                let cls = e.attr("class").unwrap_or("");
+                let id = e.attr("id").unwrap_or("");
+                let combined = format!("{cls} {id}").to_lowercase();
+                combined.contains("price")
+                    || combined.contains("product")
+                    || combined.contains("buy")
+                    || combined.contains("cart")
+            })
+            .unwrap_or(false)
+    });
+    if has_price_marker {
+        return PageType::Product;
+    }
+    // Article: at least one article element or h1.
+    if article_count >= 1 || h1_count >= 1 {
+        return PageType::Article;
+    }
+    PageType::Unknown
+}
+
+/// Compute a quality score for an extracted HTML candidate. Score is in
+/// 0.0..=1.0. Heuristics: text density, link density penalty, structural
+/// bonuses for `<article>`/`<main>`/headings, length bonus, page-type weight.
+fn score_quality(html: &str, text_len: usize, page_type: PageType) -> f32 {
+    if html.is_empty() {
+        return 0.0;
+    }
+    let total = html.len();
+    let density = (text_len as f32) / (total as f32).max(1.0);
+
+    let doc = Html::parse_fragment(html);
+    let root = doc.tree.root();
+    let mut a_count = 0usize;
+    let mut tag_count = 0usize;
+    for desc in root.descendants() {
+        if let Some(el) = desc.value().as_element() {
+            tag_count += 1;
+            if el.name() == "a" {
+                a_count += 1;
+            }
+        }
+    }
+    let link_density = if tag_count == 0 {
+        1.0
+    } else {
+        a_count as f32 / tag_count as f32
+    };
+    let link_penalty = if link_density > 0.5 {
+        0.3
+    } else if link_density > 0.3 {
+        0.6
+    } else {
+        1.0
+    };
+
+    let mut structural = 0.0_f32;
+    if html.contains("<article") || html.contains("<main") {
+        structural += 0.15;
+    }
+    if html.contains("<h1") || html.contains("<h2") {
+        structural += 0.05;
+    }
+
+    let length_bonus = (text_len as f32 / 5000.0).min(0.2);
+
+    let type_weight = match page_type {
+        PageType::Article | PageType::Doc => 1.0,
+        PageType::Product => 0.9,
+        PageType::Forum => 0.85,
+        PageType::Listing => 0.7,
+        PageType::Unknown => 0.8,
+    };
+
+    let raw = density * link_penalty * type_weight + structural + length_bonus;
+    raw.clamp(0.0, 1.0)
+}
+
+/// Count the visible text length of an HTML fragment. Strips tags and counts
+/// non-whitespace characters.
+fn visible_text_len(html: &str) -> usize {
+    let mut in_tag = false;
+    let mut count = 0usize;
+    for c in html.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag && !c.is_whitespace() {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Headings that mark the end of an article's main content. The list is
@@ -1344,5 +1624,176 @@ mod tests {
             !main.contains("example"),
             "External links list should be removed: {main}"
         );
+    }
+
+    // =====================================================================
+    // extract_main_content_v2 — quality scoring + automatic fallback
+    // =====================================================================
+
+    #[test]
+    fn v2_returns_high_quality_for_wikipedia_article() {
+        let html = r#"<html><body>
+            <nav>Skip to content</nav>
+            <main>
+                <h1 id="firstHeading">Rust (programming language)</h1>
+                <p>Rust is a multi-paradigm, general-purpose programming language
+                that emphasizes performance, type safety, and concurrency. It
+                enforces memory safety — that is, all references point to valid
+                memory — without requiring the use of a garbage collector or
+                reference counting present in other memory-safe languages.</p>
+                <p>Designed by Graydon Hoare in 2006 and announced in 2010,
+                Rust has been voted the "most loved programming language" in
+                the Stack Overflow Developer Survey every year since 2016.</p>
+                <p>It is syntactically similar to C++ but provides memory
+                safety without garbage collection, and uses a borrow checker
+                to validate reference lifetimes.</p>
+            </main>
+            <aside class="sidebar">Sidebar noise</aside>
+        </body></html>"#;
+        let r = extract_main_content_v2(html);
+        assert!(r.quality >= 0.5, "expected high quality, got {}", r.quality);
+        assert!(r.markdown.contains("Rust"));
+        assert!(!r.used_fallback);
+        assert_eq!(r.page_type, PageType::Article);
+    }
+
+    #[test]
+    fn v2_falls_back_on_js_only_page() {
+        let html = r#"<html><body>
+            <div id="root"></div>
+            <script src="app.js"></script>
+            <script>React.render(App, document.getElementById('root'));</script>
+            <noscript>Please enable JS</noscript>
+        </body></html>"#;
+        let r = extract_main_content_v2(html);
+        assert!(r.used_fallback, "expected fallback on JS-only page");
+        assert!(r.quality < 0.3, "quality should be low, got {}", r.quality);
+        assert_eq!(r.page_type, PageType::Unknown);
+    }
+
+    #[test]
+    fn v2_returns_low_quality_for_empty_input() {
+        let r = extract_main_content_v2("");
+        assert!(r.quality <= 0.1);
+        assert!(r.used_fallback);
+    }
+
+    #[test]
+    fn v2_classifies_product_page() {
+        let html = r#"<html><body>
+            <h1>Widget X</h1>
+            <div class="price">$29.99</div>
+            <div id="product-description">A great widget that solves all your problems in many ways.</div>
+            <button class="buy-now">Buy now</button>
+            <p>Free shipping on orders over $50. 30-day money-back guarantee. Customer reviews
+            rate this product 4.5 out of 5 stars based on 1234 reviews. The widget is made
+            of high-quality materials and comes with a 2-year warranty. Specifications include
+            dimensions of 10x10x5 cm and weight of 250 grams.</p>
+        </body></html>"#;
+        let r = extract_main_content_v2(html);
+        assert_eq!(r.page_type, PageType::Product);
+    }
+
+    #[test]
+    fn v2_classifies_doc_page() {
+        let html = r#"<html><body>
+            <h1>API Reference</h1>
+            <pre><code>fn main() {}</code></pre>
+            <pre><code>let x = 1;</code></pre>
+            <pre><code>println!("hi");</code></pre>
+            <pre><code>use std::io;</code></pre>
+            <pre><code>struct Foo;</code></pre>
+            <pre><code>impl Foo { fn new() -&gt; Self { Foo } }</code></pre>
+            <table><tr><th>Col</th></tr><tr><td>1</td></tr><tr><td>2</td></tr><tr><td>3</td></tr></table>
+        </body></html>"#;
+        let r = extract_main_content_v2(html);
+        assert_eq!(r.page_type, PageType::Doc);
+    }
+
+    #[test]
+    fn v2_classifies_forum_page() {
+        let html = r#"<html><body>
+            <article>
+                <h1>Question title</h1>
+                <p>Question body with enough text to pass the minimum text length threshold
+                so we can verify the page-type classification without falling back to the
+                permissive path.</p>
+                <ul>
+                    <li>Answer 1</li><li>Answer 2</li><li>Answer 3</li>
+                    <li>Answer 4</li><li>Answer 5</li><li>Answer 6</li>
+                    <li>Answer 7</li><li>Answer 8</li><li>Answer 9</li>
+                    <li>Answer 10</li><li>Answer 11</li><li>Answer 12</li>
+                </ul>
+            </article>
+        </body></html>"#;
+        let r = extract_main_content_v2(html);
+        assert_eq!(r.page_type, PageType::Forum);
+    }
+
+    #[test]
+    fn v2_quality_is_usable_helper() {
+        let good = ExtractionResult {
+            markdown: "x".repeat(500),
+            quality: 0.8,
+            page_type: PageType::Article,
+            used_fallback: false,
+        };
+        assert!(good.is_usable());
+
+        let empty = ExtractionResult {
+            markdown: String::new(),
+            quality: 0.0,
+            page_type: PageType::Unknown,
+            used_fallback: true,
+        };
+        assert!(!empty.is_usable());
+
+        let borderline = ExtractionResult {
+            markdown: "x".repeat(250),
+            quality: 0.31,
+            page_type: PageType::Article,
+            used_fallback: false,
+        };
+        assert!(borderline.is_usable());
+    }
+
+    #[test]
+    fn v2_keeps_wikipedia_tail_truncation() {
+        let html = r#"<html><body>
+            <main>
+                <h1>Foo</h1>
+                <p>Real content that should survive the extraction pipeline and end up
+                in the markdown output, even when the permissive fallback is taken.</p>
+                <h2 id="References">References</h2>
+                <p>This should be cut at the References heading.</p>
+            </main>
+        </body></html>"#;
+        let r = extract_main_content_v2(html);
+        assert!(r.markdown.contains("Real content"));
+        assert!(!r.markdown.contains("This should be cut"));
+    }
+
+    #[test]
+    fn v2_phase1_strict_path_keeps_classic_article() {
+        // A typical Wikipedia article — should be picked up by the
+        // `#mw-content-text` selector and classified as Article.
+        let html = r#"<html><body>
+            <div id="mw-content-text">
+                <h1>Rust</h1>
+                <p>Rust is a systems programming language with a focus on safety, speed,
+                and concurrency. It accomplishes these goals by being memory safe without
+                using garbage collection. Rust provides memory safety without garbage
+                collection, and uses a borrow checker to validate reference lifetimes.</p>
+                <p>The language has grown rapidly in popularity and is now used by major
+                companies including Mozilla, Microsoft, Amazon, Google, and Dropbox for
+                systems-level programming tasks where performance and reliability matter.</p>
+            </div>
+        </body></html>"#;
+        let r = extract_main_content_v2(html);
+        assert!(!r.used_fallback);
+        assert!(r.quality > 0.3);
+        assert!(r.markdown.contains("systems programming"));
+        // mw-content-text is article-style.
+        assert_eq!(r.page_type, PageType::Article);
     }
 }

@@ -194,6 +194,14 @@ pub struct ScrapeMetadata {
     pub author: Option<String>,
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Confidence score of the markdown extraction (0.0..=1.0). Drives the
+    /// caller's decision to escalate to CDP or FlareSolverr when low.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_quality: Option<f32>,
+    /// Coarse page type classification: "article" | "product" | "listing"
+    /// | "forum" | "doc" | "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

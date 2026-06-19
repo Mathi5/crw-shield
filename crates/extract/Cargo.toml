@@ -12,3 +12,4 @@ ego-tree = "0.10"
 htmd = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }

@@ -14,7 +14,7 @@ use crw_core::{
 };
 use crw_crawl::{crw_crawl, FetcherScrapeRunner};
 use crw_extract::{
-    extract_links, extract_main_content, extract_metadata, filter_tags, html_to_markdown,
+    extract_links, extract_main_content_v2, extract_metadata, filter_tags, html_to_markdown,
 };
 use crw_map::discover as map_discover;
 use crw_search::SearchClient;
@@ -76,8 +76,14 @@ async fn handle_scrape(
     let wants = |f: Format| formats.contains(&f);
 
     let mut html_for_extraction = fetch_result.html.clone();
+    let mut extraction_quality: Option<f32> = None;
+    let mut page_type: Option<String> = None;
+
     if req.only_main_content {
-        html_for_extraction = extract_main_content(&html_for_extraction);
+        let result = extract_main_content_v2(&html_for_extraction);
+        html_for_extraction = result.markdown;
+        extraction_quality = Some(result.quality);
+        page_type = Some(format!("{:?}", result.page_type).to_lowercase());
     }
     if !req.include_tags.is_empty() || !req.exclude_tags.is_empty() {
         html_for_extraction =
@@ -89,6 +95,11 @@ async fn handle_scrape(
         &fetch_result.final_url,
         fetch_result.status_code,
     );
+    let metadata = ScrapeMetadata {
+        extraction_quality,
+        page_type,
+        ..metadata
+    };
 
     let markdown = if wants(Format::Markdown) {
         Some(html_to_markdown(&html_for_extraction))

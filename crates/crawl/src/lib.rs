@@ -4,9 +4,11 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use crw_core::{CrawlRequest, CrawlStatus, CrwError, Format, Result, ScrapeData, ScrapeRequest};
+use crw_core::{
+    CrawlRequest, CrawlStatus, CrwError, Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest,
+};
 use crw_extract::{
-    extract_links, extract_main_content, extract_metadata, filter_tags, html_to_markdown,
+    extract_links, extract_main_content_v2, extract_metadata, filter_tags, html_to_markdown,
 };
 use crw_fetch::{FetchResult, Fetcher};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -117,8 +119,14 @@ pub fn scrape_data_from_fetch(fetch: &FetchResult, req: &ScrapeRequest) -> Resul
     let wants = |f: Format| formats.contains(&f);
 
     let mut html_for_extraction = fetch.html.clone();
+    let mut extraction_quality: Option<f32> = None;
+    let mut page_type: Option<String> = None;
+
     if req.only_main_content {
-        html_for_extraction = extract_main_content(&html_for_extraction);
+        let result = extract_main_content_v2(&html_for_extraction);
+        html_for_extraction = result.markdown;
+        extraction_quality = Some(result.quality);
+        page_type = Some(format!("{:?}", result.page_type).to_lowercase());
     }
     if !req.include_tags.is_empty() || !req.exclude_tags.is_empty() {
         html_for_extraction =
@@ -126,6 +134,11 @@ pub fn scrape_data_from_fetch(fetch: &FetchResult, req: &ScrapeRequest) -> Resul
     }
 
     let metadata = extract_metadata(&fetch.html, &fetch.final_url, fetch.status_code);
+    let metadata = ScrapeMetadata {
+        extraction_quality,
+        page_type,
+        ..metadata
+    };
 
     let markdown = if wants(Format::Markdown) {
         Some(html_to_markdown(&html_for_extraction))
