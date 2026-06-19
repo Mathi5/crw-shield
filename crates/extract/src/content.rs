@@ -1,6 +1,8 @@
 //! Content extraction — stripping boilerplate and isolating the main content
 //! area before downstream markdown conversion.
 
+#[cfg(test)]
+use crw_antibot::situation::diagnose;
 use crw_antibot::situation::{SituationKind, SituationReport};
 use scraper::{element_ref::ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -2128,6 +2130,68 @@ mod tests {
         let d = situation_aware_decision(Some(&report), html, &base);
         assert_eq!(d.reason, ExtractionReason::Empty);
         assert_eq!(d.quality_override, Some(0.05));
+    }
+
+    #[test]
+    fn cf_ray_alone_on_2xx_is_not_a_challenge() {
+        // Regression test: a real Wikipedia article served through
+        // Cloudflare's CDN has a cf-ray header but no challenge HTML.
+        // The detector must NOT classify it as CloudflareIuam — that's
+        // a false positive.
+        let html = r#"<html><head><title>Rust</title></head>
+        <body><main><h1>Rust</h1><p>Real article content here. Multiple
+        sentences about the Rust programming language and its features
+        like memory safety, zero-cost abstractions, and concurrency.
+        This is the kind of long-form content we want to extract.</p>
+        </main></body></html>"#;
+        let headers = vec![("cf-ray".to_string(), "abc123-CDG".to_string())];
+        let report = diagnose(html, Some(200), Some(&headers));
+        assert_eq!(
+            report.kind,
+            SituationKind::CleanSuccess,
+            "cf-ray alone on 2xx should not trigger Cloudflare detection"
+        );
+    }
+
+    #[test]
+    fn cf_ray_with_challenge_body_on_2xx_is_cloudflare_iuam() {
+        // The body *does* contain a challenge marker, so the header
+        // match is corroborated and we should detect CloudflareIuam.
+        let html = r#"<!DOCTYPE html><html><head>
+        <title>Just a moment...</title>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+        </head><body>cf-mitigated</body></html>"#;
+        let headers = vec![("cf-ray".to_string(), "abc123-CDG".to_string())];
+        let report = diagnose(html, Some(200), Some(&headers));
+        assert_eq!(report.kind, SituationKind::CloudflareIuam);
+    }
+
+    #[test]
+    fn cf_ray_with_challenge_body_on_403_still_cloudflare() {
+        // 4xx + cf-ray + challenge body — definitely a Cloudflare block.
+        let html = r#"<html><head><title>Just a moment...</title></head>
+        <body>cf-mitigated</body></html>"#;
+        let headers = vec![("cf-ray".to_string(), "abc-CDG".to_string())];
+        let report = diagnose(html, Some(403), Some(&headers));
+        assert_eq!(report.kind, SituationKind::CloudflareIuam);
+    }
+
+    #[test]
+    fn akamai_header_alone_on_2xx_is_not_a_block() {
+        // Same logic: akamai-* headers on a 2xx response without any
+        // body evidence is just an Akamai CDN cache hit, not a bot
+        // manager block.
+        let html = r#"<html><body><p>Real content with enough text to
+        be a real page, not a bot challenge. We need several sentences
+        to make sure the page is recognised as real content rather than
+        an empty SPA shell or a challenge interstitial.</p></body></html>"#;
+        let headers = vec![("x-akamai-transformed".to_string(), "9 9 9".to_string())];
+        let report = diagnose(html, Some(200), Some(&headers));
+        assert_eq!(
+            report.kind,
+            SituationKind::CleanSuccess,
+            "akamai header alone on 2xx should not trigger Akamai detection"
+        );
     }
 
     #[test]

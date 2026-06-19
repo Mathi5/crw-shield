@@ -304,25 +304,67 @@ impl fmt::Display for EvidenceKind {
 /// This is the *replacement* for `challenge_detect::detect_challenge` and
 /// `detect_empty_or_blocked`. The legacy functions are now thin wrappers
 /// around this.
+///
+/// **Detection philosophy**: we want to flag *real* anti-bot blocks
+/// without producing false positives on every page that happens to be
+/// served through Cloudflare's CDN. The compromise:
+///
+///   1. If the status code is 4xx/5xx, header-based detection is enough
+///      — the server is telling us something is wrong.
+///   2. If the status code is 2xx, we require BOTH a provider header
+///      AND at least one provider-specific token in the body. The
+///      combination is what tells us the response is a challenge page
+///      and not just an article served by a CDN.
 pub fn diagnose(
     html: &str,
     status_code: Option<u16>,
     headers: Option<&[(String, String)]>,
 ) -> SituationReport {
+    // Pre-tokenize the body once.
+    let lower = html.to_ascii_lowercase();
+    let body_has_tokens = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+
     // 1. Look at headers first — they're the cheapest signal.
     if let Some(hs) = headers {
         if let Some(ev) = match_header(hs) {
-            return build_report(
-                ev.kind,
-                ev.suggested_ladder,
-                status_code,
-                vec![Evidence {
-                    kind: EvidenceKind::Header,
-                    value: ev.header_name.to_string(),
-                    provider: ev.provider_name.to_string(),
-                }],
-                Some(ev.notes),
-            );
+            // Phase C.2: require corroborating body evidence when the
+            // status is 2xx. A cf-ray header on a 200 response is just
+            // a Cloudflare CDN cache hit; cf-ray + "checking your
+            // browser" is a real challenge.
+            let status_2xx = matches!(status_code, Some(200..=299));
+            if status_2xx {
+                let requires = header_body_tokens(ev.provider_name);
+                if !body_has_tokens(requires) {
+                    // Skip the header-based detection — the body looks
+                    // clean. The token-scan step below will catch real
+                    // challenges.
+                } else {
+                    return build_report(
+                        ev.kind,
+                        ev.suggested_ladder,
+                        status_code,
+                        vec![Evidence {
+                            kind: EvidenceKind::Header,
+                            value: ev.header_name.to_string(),
+                            provider: ev.provider_name.to_string(),
+                        }],
+                        Some(ev.notes),
+                    );
+                }
+            } else {
+                // Non-2xx: trust the header.
+                return build_report(
+                    ev.kind,
+                    ev.suggested_ladder,
+                    status_code,
+                    vec![Evidence {
+                        kind: EvidenceKind::Header,
+                        value: ev.header_name.to_string(),
+                        provider: ev.provider_name.to_string(),
+                    }],
+                    Some(ev.notes),
+                );
+            }
         }
     }
 
@@ -360,7 +402,6 @@ pub fn diagnose(
     }
 
     // 3. Token-scan the HTML. Score every provider, pick the highest.
-    let lower = html.to_ascii_lowercase();
     let mut best: Option<(usize, &ProviderEntry, Vec<Evidence>)> = None;
     for entry in providers::all() {
         let mut hits = 0usize;
@@ -373,8 +414,6 @@ pub fn diagnose(
                     value: format!("\"{token}\"@{pos}"),
                     provider: entry.name.to_string(),
                 });
-                // Two token matches are enough — don't fill the report with
-                // every occurrence.
                 if hits >= 2 {
                     break;
                 }
@@ -410,6 +449,77 @@ pub fn diagnose(
     let mut report = SituationReport::clean();
     report.status_code = status_code;
     report
+}
+
+/// Body tokens that, when paired with a provider header, confirm a real
+/// anti-bot block (vs. a CDN cache hit). The list is intentionally
+/// short — we want to be conservative.
+fn header_body_tokens(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "cloudflare_iuam" => &[
+            "checking your browser before accessing",
+            "cf-mitigated",
+            "cf_chl_",
+            "challenges.cloudflare.com",
+            "cf-chl-bypass",
+            "turnstile-v0",
+            "ray id",
+            "performing security verification",
+            "verifying you are human",
+            "please verify you are a human",
+        ],
+        "cloudflare_turnstile" => &[
+            "challenges.cloudflare.com/turnstile",
+            "cf-turnstile",
+            "turnstile.render",
+        ],
+        "imperva_incapsula" => &[
+            "_incapsula_resource",
+            "incap_ses_",
+            "visid_incap_",
+            "pardon our interruption",
+            "you have been blocked",
+            "request rejected",
+        ],
+        "akamai_bot_manager" => &[
+            "akamai challenge",
+            "akamai/abot",
+            "akamai-bm",
+            "pm_akamai",
+            "x-amz-rid",
+            "ghostbox",
+            "akamai-bm-sc",
+        ],
+        "datadome_captcha" => &[
+            "ddc-captcha",
+            "datadome.co",
+            "geo.captcha-delivery",
+            "captcha-delivery.com",
+            "datadome-captcha",
+            "datadome-protected",
+        ],
+        "kasada" => &["kasada", "kpsdk", "kasada-akamai"],
+        "perimeterx" => &[
+            "perimeterx",
+            "px-captcha",
+            "px-app",
+            "_pxappid",
+            "pxcaptcha",
+            "humansecurity",
+        ],
+        "aws_waf" => &[
+            "aws-waf",
+            "x-amz-waf",
+            "request rejected",
+            "this request was blocked",
+        ],
+        _ => &[
+            "captcha",
+            "challenge",
+            "checking your browser",
+            "access denied",
+        ],
+    }
 }
 
 fn build_report(
