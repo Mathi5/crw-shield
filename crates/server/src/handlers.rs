@@ -56,7 +56,7 @@ async fn handle_scrape(
 
     let ladder_result = state
         .ladder
-        .fetch(&req)
+        .fetch_with_rotation(&req, &state.host_counters)
         .await
         .map_err(|e| ErrorResponse::new(e.code(), e.to_string()))?;
 
