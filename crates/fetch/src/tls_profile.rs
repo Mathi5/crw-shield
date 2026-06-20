@@ -28,6 +28,7 @@ pub enum BrowserEmulation {
     Chrome130,
     Chrome128,
     Firefox128,
+    Firefox123,
     Firefox133,
     Safari18,
 }
@@ -62,6 +63,9 @@ impl BrowserEmulation {
             BrowserEmulation::Chrome128 => Emulation::Chrome128,
             BrowserEmulation::Chrome124 => Emulation::Chrome124,
             BrowserEmulation::Firefox128 => Emulation::Firefox128,
+            // wreq-util 2.2.6 does not ship a Firefox123 emulation;
+            // Firefox128 is the closest NSS-based profile available.
+            BrowserEmulation::Firefox123 => Emulation::Firefox128,
             BrowserEmulation::Firefox133 => Emulation::Firefox133,
             BrowserEmulation::Safari18 => Emulation::Safari18,
         }
@@ -81,10 +85,19 @@ pub fn pick_emulation_for_profile(profile: &BrowserProfile) -> Emulation {
 ///
 /// The client is plain HTTP/2 (with HTTP/1.1 fallback) + BoringSSL TLS — no
 /// extra features enabled beyond the workspace default.
+///
+/// **Redirect policy**: unlike `reqwest` (which follows up to 10 redirects by
+/// default), `wreq::ClientBuilder` defaults to `Policy::none()`. This breaks
+/// any URL that issues a 301/302/307/308 (rust-lang.org, twitter.com → x.com,
+/// amazon.fr product pages, etc.) — wreq raises `redirect loop detected` on
+/// the first 3xx and our fetch returns `FETCH_ERROR`. We explicitly opt into
+/// the same default behaviour as reqwest so the rest of the pipeline (which
+/// assumes redirects are followed) keeps working.
 pub fn build_wreq_client(emulation: Emulation, timeout_ms: u32) -> Result<wreq::Client> {
     wreq::Client::builder()
         .emulation(emulation)
         .timeout(Duration::from_millis(u64::from(timeout_ms)))
+        .redirect(wreq::redirect::Policy::limited(10))
         .build()
         .map_err(|e| CrwError::Fetch(format!("wreq client build: {e}")))
 }

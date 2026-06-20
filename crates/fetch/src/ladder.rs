@@ -14,10 +14,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use crw_antibot::{
-    detect_empty_or_blocked, diagnose_situation, CookieJar, SituationReport, SuggestedLadder,
+    detect_empty_or_blocked, decide_rotation, diagnose_situation, CookieJar,
+    HostCounters, RotationDecision, SituationReport, SuggestedLadder,
 };
 use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, ScrapeResponse};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::cdp::{CdpFetchResult, CdpFetcher};
 use crate::flaresolverr::FlareSolverrClient;
@@ -248,6 +249,11 @@ impl FetchLadder {
         from_cdp: bool,
     ) -> Result<Option<LadderResult>> {
         let Some(fs) = self.flaresolverr.as_ref() else {
+            warn!(
+                url = %url,
+                from_cdp,
+                "FlareSolverr escalation skipped: no client configured (set FLARESOLVERR_URL)"
+            );
             return Ok(None);
         };
         debug!(url = %url, "escalating to FlareSolverr");
@@ -335,17 +341,21 @@ impl FetchLadder {
                             }
                             Err(e) => {
                                 warn!(error=%e, "CDP fallback failed after challenge; trying FlareSolverr");
-                                if let Some(fs_result) =
-                                    self.try_flaresolverr(&request.url, request, true).await?
-                                {
-                                    return Ok(fs_result);
+                                match self.try_flaresolverr(&request.url, request, true).await? {
+                                    Some(fs_result) => return Ok(fs_result),
+                                    None => {
+                                        // CDP failed AND FlareSolverr unavailable.
+                                        // Surface CDP error (not the original HTTP
+                                        // fetch, which was deemed challenging) so
+                                        // the caller can decide whether to retry
+                                        // with a different profile.
+                                        warn!(
+                                            url = %request.url,
+                                            "Ladder exhausted: CDP failed and FlareSolverr unavailable; returning CDP error"
+                                        );
+                                        return Err(e);
+                                    }
                                 }
-                                return Ok(LadderResult {
-                                    fetch,
-                                    screenshot: None,
-                                    source: FetchSource::Http,
-                                    situation,
-                                });
                             }
                         }
                     }
@@ -429,6 +439,89 @@ impl FetchLadder {
             source: FetchSource::Cdp,
             situation,
         })
+    }
+
+    /// Run the ladder with reactive profile rotation on detected blocks.
+    ///
+    /// Wraps [`Self::fetch`] with the L0–L3 ladder from
+    /// `crw_antibot::rotation`:
+    /// - **L0 Accept**: ladder returns clean content → done.
+    /// - **L1 ClearAndRetry**: ladder detected a block on first attempt →
+    ///   clear cookies and retry once on the same profile (no restart).
+    /// - **L2 Rotate**: still blocked after L1 → log a "should rotate"
+    ///   recommendation (the full rotation machinery — restart Chrome,
+    ///   switch profile dir, 15 s cooldown — is out of scope for this
+    ///   method; the caller is expected to re-invoke the ladder with a
+    ///   different `HttpFetcher` instance configured with the next
+    ///   profile if they want full rotation).
+    /// - **L3 Fail**: rotation budget exhausted → return the original
+    ///   result (caller will surface the block as an error).
+    ///
+    /// `host_counters` is shared across calls so the L1/L2 bookkeeping
+    /// sticks across requests for the same host.
+    pub async fn fetch_with_rotation(
+        &self,
+        request: &ScrapeRequest,
+        host_counters: &HostCounters,
+    ) -> Result<LadderResult> {
+        // First attempt: just run the ladder.
+        let mut result = self.fetch(request).await?;
+        let host = url::Url::parse(&request.url)
+            .ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| request.url.clone());
+        // We don't have the title from the ladder result, but
+        // `detect_block` only uses it as a stronger signal — empty title
+        // is acceptable.
+        let title = "";
+        let decision = decide_rotation(&result.fetch.html, title, &host, 0, host_counters, 7);
+        match decision {
+            RotationDecision::Accept => Ok(result),
+            RotationDecision::ClearAndRetry { signal } => {
+                info!(
+                    url = %request.url,
+                    kind = ?signal.kind,
+                    confidence = signal.confidence,
+                    "L1 ClearAndRetry: sleeping 1s and retrying (cookie clear is TODO: requires CookieJar API extension)"
+                );
+                // NOTE: ideally we'd call `self.cookies.clear_for_host(&host)`
+                // here, but CookieJar doesn't expose that method yet. We
+                // still sleep + retry: clearing-cookies is a "best effort"
+                // optimization, not a correctness fix.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                result = self.fetch(request).await?;
+                Ok(result)
+            }
+            RotationDecision::Rotate {
+                signal,
+                next_profile_idx,
+            } => {
+                warn!(
+                    url = %request.url,
+                    kind = ?signal.kind,
+                    next_profile_idx,
+                    "L2 Rotate: rotation would switch to profile {} (full rotation requires caller to reconfigure the HttpFetcher)",
+                    next_profile_idx
+                );
+                // We don't have the machinery to actually restart Chrome
+                // and switch profile dir from here — that needs a caller
+                // that owns the fetcher lifecycle. So we just return the
+                // current (likely blocked) result with a log.
+                Ok(result)
+            }
+            RotationDecision::Fail {
+                signal,
+                rotations_used,
+            } => {
+                warn!(
+                    url = %request.url,
+                    kind = ?signal.kind,
+                    rotations_used,
+                    "L3 Fail: rotation budget exhausted on this host"
+                );
+                Ok(result)
+            }
+        }
     }
 }
 

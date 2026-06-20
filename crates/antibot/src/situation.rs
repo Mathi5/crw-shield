@@ -405,15 +405,27 @@ pub fn diagnose(
     // Tokens shorter than 4 characters are skipped — they cause too
     // many false positives (`"dd_"`, `"id_"`, `"js"`, etc. match
     // legitimate HTML).
+    //
+    // To avoid Wikipedia-class false positives where a generic word like
+    // `"forbidden"` appears once in a legitimate article, we require
+    // STRONGER evidence on a 2xx response:
+    //   - 2+ distinct token matches (same provider), OR
+    //   - 1 token match with length >= SINGLE_HIT_MIN_LEN (a phrase long
+    //     enough that it almost never appears in normal prose).
+    const SINGLE_HIT_MIN_LEN: usize = 14;
     let mut best: Option<(usize, &ProviderEntry, Vec<Evidence>)> = None;
     for entry in providers::all() {
         let mut hits = 0usize;
         let mut ev = Vec::new();
+        let mut first_match_len = 0usize;
         for token in &entry.tokens_lower {
             if token.len() < 4 {
                 continue;
             }
             if let Some(pos) = lower.find(token) {
+                if hits == 0 {
+                    first_match_len = token.len();
+                }
                 hits += 1;
                 ev.push(Evidence {
                     kind: EvidenceKind::Token,
@@ -425,7 +437,16 @@ pub fn diagnose(
                 }
             }
         }
-        if hits > 0 && best.as_ref().is_none_or(|(s, _, _)| hits > *s) {
+        // Decide if this provider is "strong enough" to claim.
+        let strong_enough = if status_code == Some(200) {
+            // 2xx: never trust a single short token.
+            hits >= 2 || (hits == 1 && first_match_len >= SINGLE_HIT_MIN_LEN)
+        } else {
+            // Non-2xx (403, 503, ...): single token is acceptable, status
+            // code already adds evidence.
+            hits >= 1
+        };
+        if strong_enough && best.as_ref().is_none_or(|(s, _, _)| hits > *s) {
             best = Some((hits, entry, ev));
         }
     }
