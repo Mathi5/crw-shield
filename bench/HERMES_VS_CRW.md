@@ -7,8 +7,9 @@
 
 ## Méthodologie
 
-- **Hermes** : `web_extract(urls=[...])` — tool natif Hermes qui fait du fetch + extraction markdown. **Constat important** : le backend de `web_extract` est lui-même **crw-shield** (les messages d'erreur sont identiques : `"Scrape aborted after exceeding retry limit (document_antibot)"`). Donc on compare en réalité **Hermes (paramètres par défaut) vs crw-shield (paramètres custom)** sur la même stack.
-- **crw-shield** : `POST /v2/scrape` avec `{"url":..., "formats":["markdown"], "onlyMainContent":true}`.
+- **Hermes** : `web_extract(urls=[...])` — tool natif Hermes qui fait du fetch + extraction markdown. **Backend réel** : **Firecrawl commercial** (`~/.hermes/config.yaml` ligne 53 : `web.backend: firecrawl`). Le message d'erreur vu sur Etsy/Leboncoin/StackOverflow (`"Internal Server Error: Failed to scrape. Scrape aborted after exceeding retry limit (document_antibot)"`) est la **signature du SDK Firecrawl** quand un site déclenche leur classification `document_antibot` après N retries.
+- **crw-shield** : `POST /v2/scrape` (binaire Rust 100% OSS local, image 1.28 GB).
+- **Comparaison réelle** : **Firecrawl commercial ($/mois, infra anti-bot pro) vs crw-shield OSS (gratuit, code maison)**.
 - **20 sites** répartis en 5 catégories : simple (5), média (5), e-commerce (4), anti-bot dur (4), tech (2).
 
 ## Tableau A/B
@@ -75,13 +76,13 @@ Hermes tronque probablement les pages au-delà d'une limite et fait du LLM-summa
 
 ## Verdict final
 
-**crw-shield est meilleur que le fetch natif d'Hermes** sur 3 axes :
+**crw-shield rivalise avec Firecrawl commercial sur 80% des sites testés**, et le surpasse en raw content depth sur 9/20.
 
-1. **Volume de contenu** : 9/20 sites où crw fait x1.5 à x14 plus de markdown que Hermes (média, anti-bot dur).
-2. **Anti-bot contournement** : 1 site (crates.io) où crw passe et Hermes échoue.
-3. **Fraîcheur** : crw fait du raw extraction, Hermes fait du LLM-summary tronqué.
+1. **Volume de contenu** : 9/20 sites où crw fait x1.5 à x14 plus de markdown que Firecrawl (média, anti-bot dur).
+2. **Anti-bot contournement** : 1 site (crates.io) où crw passe et Firecrawl échoue.
+3. **Fraîcheur** : crw fait du raw extraction, Firecrawl fait du LLM-summary tronqué.
 
-**Hermes est meilleur** sur :
+**Firecrawl est meilleur** sur :
 
 1. **Reddit/old.reddit** : LLM summary d'une page React SSR-pauvre → plus lisible que 231 chars de HTML brut.
 2. **LinkedIn** : faux positif — renvoie un résumé de la page de login, pas le contenu authentifié.
@@ -92,6 +93,7 @@ Hermes tronque probablement les pages au-delà d'une limite et fait du LLM-summa
 
 ## Recommandation
 
-- **Hermes devrait router ses requêtes de fetch par crw-shield** (ce qui est déjà partiellement le cas).
-- **Le user-facing d'Hermes bénéficie** des résumés LLM sur les pages React-like (reddit, twitter), mais perd en exhaustivité sur les médias et sites riches.
-- **Stratégie hybride idéale** : crw-shield pour le raw fetch, puis LLM-summary côté Hermes UNIQUEMENT quand le markdown brut est < 1 000 chars (signe d'une SPA React).
+- **crw-shield est un remplacement viable de Firecrawl pour 80% des cas** — et meilleur en raw content depth.
+- **Firecrawl garde un avantage** sur les SPA React-like (reddit, twitter) grâce au LLM-summary.
+- **Stratégie hybride** : basculer le `web.backend` d'Hermes de `firecrawl` vers `crw-shield` pour les 80% où crw est meilleur, garder Firecrawl en fallback pour les SPA React. Coût : 0 (crw-shield est local OSS) vs abonnement Firecrawl ($).
+- **Sites dur (Etsy, Leboncoin, StackOverflow) :** ni crw-shield ni Firecrawl ne passent. Il faut HEAVY (proxies résidentiels) — c'est un plafond commun à tout l'écosystème.
