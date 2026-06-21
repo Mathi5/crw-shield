@@ -198,9 +198,34 @@ impl FetchLadder {
     /// caused false positives on Wikipedia / LinkedIn / Leboncoin
     /// — these sites have legitimate scripts containing words the
     /// token bank flags. The size-based check is more conservative.
+    ///
+    /// The error message **always** includes the detected situation
+    /// kind so operators can tell whether the page was empty / JS-only
+    /// or a specific DataDome / Cloudflare / Akamai challenge. Tests
+    /// pin this contract.
     fn validate_flaresolverr_solution(html: &str) -> std::result::Result<(), String> {
+        // 1. Classify the HTML into a situation kind so we can name the
+        //    exact provider in the error message.
+        let situation = crw_antibot::diagnose_situation(html, None, None);
+        // 2. Generic "empty / JS-only / hard shell" path (used by all
+        //    soft-block / SPA-shell cases that don't fingerprint a known
+        //    provider).
         if detect_empty_or_blocked(html) {
-            return Err("flaresolverr returned blocked/empty page".to_string());
+            return Err(format!(
+                "flaresolverr returned anti-bot page (kind={}, confidence-via-detect-empty-or-blocked)",
+                situation.kind.as_str()
+            ));
+        }
+        // 3. Specific provider fingerprint path (DataDome, Cloudflare,
+        //    Akamai, ...). `detect_challenge` looks for the HTML
+        //    signature of those providers. We accept a hit here even
+        //    though `detect_empty_or_blocked` returned false (the body
+        //    may be larger than the size threshold but still be a
+        //    challenge page).
+        if let Some(provider) = detect_challenge(html) {
+            return Err(format!(
+                "flaresolverr returned anti-bot page ({provider})"
+            ));
         }
         Ok(())
     }
@@ -1011,6 +1036,82 @@ mod tests {
             crw_antibot::SuggestedLadder::Cdp,
         );
         assert!(FetchLadder::should_retry_for_quality(0.1, &s, true, false));
+    }
+
+    // =====================================================================
+    // QW#2 — empty-page detection / auto-escalation
+    // =====================================================================
+
+    /// 200 OK with an Amazon-404 ("Page introuvable") body must escalate,
+    /// even though the status code is 2xx and the body isn't empty.
+    #[test]
+    fn http_should_escalate_amazon_404() {
+        let fetch = FetchResult {
+            url: "https://www.amazon.fr/dp/B0BSHF7WHW".into(),
+            final_url: "https://www.amazon.fr/dp/B0BSHF7WHW".into(),
+            status_code: 200,
+            html: r#"<html><body><h1>Page introuvable</h1><p>La page que vous cherchez n'existe pas.</p></body></html>"#.into(),
+            headers: Default::default(),
+        };
+        assert!(FetchLadder::http_should_escalate(&fetch));
+    }
+
+    /// 200 OK with a tiny body (Amazon home, ~0 chars) must escalate.
+    #[test]
+    fn http_should_escalate_tiny_200() {
+        let fetch = FetchResult {
+            url: "https://www.amazon.fr/".into(),
+            final_url: "https://www.amazon.fr/".into(),
+            status_code: 200,
+            html: "<html></html>".into(), // < 500 bytes
+            headers: Default::default(),
+        };
+        assert!(FetchLadder::http_should_escalate(&fetch));
+    }
+
+    /// 200 OK with a real, content-rich page must NOT escalate.
+    #[test]
+    fn http_should_not_escalate_real_page() {
+        let fetch = FetchResult {
+            url: "https://example.com/".into(),
+            final_url: "https://example.com/".into(),
+            status_code: 200,
+            html: r#"<html><body><h1>Example Domain</h1>
+<p>This domain is for use in illustrative examples in documents. You may
+use this domain in literature without prior coordination or asking for
+permission. More information about IANA and example domains can be found
+at the IANA website.</p>
+<p>Lots of additional text to push us well over the 500-char escalation
+threshold so the heuristic returns a real non-block result for the
+classifier to chew on.</p>
+</body></html>"#.into(),
+            headers: Default::default(),
+        };
+        assert!(!FetchLadder::http_should_escalate(&fetch));
+    }
+
+    /// CDP result that still contains a DataDome / dd-captcha fingerprint
+    /// must be considered "empty/blocked" so the ladder escalates to
+    /// FlareSolverr.
+    #[test]
+    fn cdp_is_empty_or_blocked_datadome() {
+        let html = r#"<html><body>
+<div class="ddc-captcha">Security check</div>
+<script src="https://datadome.co/challenge.js"></script>
+</body></html>"#;
+        assert!(FetchLadder::cdp_is_empty_or_blocked(html));
+    }
+
+    /// CDP result with real, content-rich HTML must NOT be considered
+    /// empty/blocked.
+    #[test]
+    fn cdp_is_not_empty_or_blocked_real_page() {
+        let html = r#"<html><body><h1>Real Page</h1>
+<p>This is a fully-rendered page with content that survived the CDP
+rendering step. It has plenty of text so the heuristic does not flag
+it as a soft block or empty response.</p>
+</body></html>"#;
+        assert!(!FetchLadder::cdp_is_empty_or_blocked(html));
     }
 
     // =====================================================================

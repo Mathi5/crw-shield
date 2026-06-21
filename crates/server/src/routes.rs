@@ -4,7 +4,9 @@ use axum::{
 };
 use tower::ServiceBuilder;
 
-use crate::handlers::{crawl_cancel, crawl_start, crawl_status, health, map, scrape, search};
+use crate::handlers::{
+    crawl_cancel, crawl_start, crawl_status, health, hitl_enqueue, map, scrape, search,
+};
 use crate::middleware::auth_middleware;
 use crate::state::AppState;
 
@@ -13,6 +15,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v2/scrape", post(scrape))
+        .route("/v2/scrape/hitl", post(hitl_enqueue))
         .route("/v2/crawl", post(crawl_start))
         .route("/v2/crawl/:id", get(crawl_status))
         .route("/v2/crawl/:id", delete(crawl_cancel))

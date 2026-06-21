@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::block_detection::{BlockKind, HostCounters};
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn empty_counters() -> HostCounters {
         Arc::new(Mutex::new(HashMap::new()))
@@ -193,16 +193,23 @@ mod tests {
     #[test]
     fn rotation_jumps_to_firefox_on_first_l2() {
         let counters = empty_counters();
-        let html = "<html><body>blocked</body></html>";
+        // Use a Cloudflare-IUAM-shaped payload so `detect()` returns
+        // Some(...). With a tiny/HTML-looking body, `detect` returns None
+        // (looks_like_html bypasses the Empty branch) and `decide` would
+        // resolve to Accept — never Rotate.
+        let html = "<html><body>cf-mitigated Just a moment...</body></html>";
         let c = counter_for("blocked.com", &counters);
         c.mark_l1_attempted();
         // First L2
-        let decision = decide(html, "blocked", "blocked.com", 0, &counters, 7);
+        let decision = decide(html, "Just a moment...", "blocked.com", 0, &counters, 7);
         match decision {
-            RotationDecision::Rotate { next_profile_idx, .. } => {
+            RotationDecision::Rotate {
+                next_profile_idx,
+                ..
+            } => {
                 assert_eq!(next_profile_idx, 5, "should jump to Firefox");
             }
-            _ => panic!("expected Rotate"),
+            other => panic!("expected Rotate, got {other:?}"),
         }
     }
 

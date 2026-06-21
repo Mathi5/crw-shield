@@ -18,16 +18,123 @@ use crw_extract::{
 };
 use crw_map::discover as map_discover;
 use crw_search::SearchClient;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::state::AppState;
 
+/// HITL (Human-In-The-Loop) request — used when automatic anti-bot
+/// escalation has been exhausted (DataDome/Cloudflare IUAM/PerimeterX
+/// hard-captcha) and the caller wants to hand the challenge to a human.
+///
+/// The container is headless so we can't open a real visible browser.
+/// Instead, the handler records the URL + challenge kind in a queue file
+/// at `/tmp/hitl_queue.json` so an external process (Playwright Desktop,
+/// human in front of Chrome, ...) can pick it up, solve the challenge
+/// outside, and write the resulting cookies to the same file. A later
+/// `GET /v2/scrape/hitl/result?id=...` can read the solved cookies and
+/// re-run the ladder with them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HitlRequest {
+    pub url: String,
+    /// What kind of challenge we're stuck on. Used for telemetry and to
+    /// give the human a hint. Optional.
+    #[serde(default)]
+    pub challenge_kind: Option<String>,
+    /// Free-form context. Stored verbatim alongside the queue entry.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HitlEnqueueResponse {
+    pub success: bool,
+    pub hitl_required: bool,
+    pub id: String,
+    pub queue_file: String,
+    pub instructions: String,
+    pub created_at: String,
+}
+
+const HITL_QUEUE_PATH: &str = "/tmp/hitl_queue.json";
+
+/// POST /v2/scrape/hitl
+///
+/// Records a URL that needs a human to solve a captcha. Returns
+/// immediately with a `hitl_required: true` payload pointing to the
+/// queue file. Does not block waiting for a solution — the caller is
+/// expected to poll `GET /v2/scrape/hitl/result?id=...` or call
+/// `/v2/scrape` again with `cookies` populated from the result file.
+pub async fn hitl_enqueue(
+    State(state): State<AppState>,
+    Json(req): Json<HitlRequest>,
+) -> impl IntoResponse {
+    let resp = handle_hitl_enqueue(&state, req).await;
+    match resp {
+        Ok(r) => (StatusCode::ACCEPTED, Json(json!(r))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"success": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_hitl_enqueue(
+    _state: &AppState,
+    req: HitlRequest,
+) -> Result<HitlEnqueueResponse, String> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let entry = json!({
+        "id": id,
+        "url": req.url,
+        "challenge_kind": req.challenge_kind,
+        "note": req.note,
+        "status": "pending",
+        "created_at": now.to_rfc3339(),
+    });
+    // Read existing queue (if any) and append. We use a simple file-based
+    // queue because we're running in a headless container — no Redis, no
+    // Postgres, just /tmp. Each entry is on its own line (NDJSON) so
+    // multiple concurrent enqueues don't clobber each other.
+    let queue_path = PathBuf::from(HITL_QUEUE_PATH);
+    let mut line = serde_json::to_string(&entry)
+        .map_err(|e| format!("serialize entry: {e}"))?;
+    line.push('\n');
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&queue_path)
+        .map_err(|e| format!("open queue file {}: {e}", queue_path.display()))?;
+    f.write_all(line.as_bytes())
+        .map_err(|e| format!("append to queue file: {e}"))?;
+    info!(id = %id, url = %req.url, "HITL: challenge enqueued");
+    let id_for_response = id.clone();
+    Ok(HitlEnqueueResponse {
+        success: true,
+        hitl_required: true,
+        id: id_for_response,
+        queue_file: HITL_QUEUE_PATH.to_string(),
+        instructions: format!(
+            "Open {} in a visible browser, solve the challenge, then write \
+             the resulting cookies (name=value; domain=...) to {} with id={} \
+             and status='solved'. A subsequent /v2/scrape call with these \
+             cookies will succeed.",
+            req.url, HITL_QUEUE_PATH, id
+        ),
+        created_at: now.to_rfc3339(),
+    })
+}
+
 pub async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}))
+    Json(json!({"status": "ok","version": env!("CARGO_PKG_VERSION")}))
 }
 
 pub async fn scrape(
