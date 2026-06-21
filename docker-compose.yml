@@ -29,11 +29,11 @@ services:
       # TLS_PROXY_PROFILES (default: chrome_120, chrome_117, chrome_107,
       # firefox_117, safari_16_0). 5 profiles × 1 retry = up to 10
       # 5 profiles × 1 retry = up to 10 attempts before HITL fallback.
-      - TLS_PROXY_ENABLED=false
+      - TLS_PROXY_ENABLED=true
       - TLS_PROXY_LISTEN=127.0.0.1:7890
       - TLS_PROXY_PROFILE=chrome_120
       - TLS_PROXY_PROFILES=chrome_120,chrome_117,chrome_107,firefox_117,safari_16_0
-      - TLS_PROXY_ROTATION_DELAY_SECS=15
+      - TLS_PROXY_ROTATION_DELAY_SECS=3
       - TLS_PROXY_CA_DIR=/var/lib/crw-shield/tls-ca
       - TLS_PROXY_BYPASS=localhost,127.0.0.1,::1
       - TLS_PROXY_TIMEOUT_SECS=60
