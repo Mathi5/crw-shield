@@ -20,7 +20,7 @@ use crw_antibot::{stealth_script, CookieJar};
 use crw_core::{BrowserAction, CrwError, Result, ScrapeRequest};
 use futures::StreamExt;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 use url::Url;
 
 use crate::http::{FetchResult, Fetcher};
@@ -48,6 +48,13 @@ pub struct CdpConfig {
     pub request_timeout: Duration,
     pub launch_timeout: Duration,
     pub enable_stealth: bool,
+    /// If `Some`, the CDP fetcher will inject `--proxy-server`,
+    /// `--ignore-certificate-errors`, and `--proxy-bypass-list` into
+    /// the chromiumoxide `BrowserConfig` so Chrome's HTTPS traffic
+    /// flows through the tls-impersonate-proxy sidecar.
+    /// `None` = no proxy (default). Set via `TLS_PROXY_ENABLED=true`
+    /// + the other `TLS_PROXY_*` env vars read by `TlsProxyConfig::from_env`.
+    pub tls_proxy: Option<crate::tls_proxy::TlsProxyConfig>,
 }
 
 impl Default for CdpConfig {
@@ -61,6 +68,7 @@ impl Default for CdpConfig {
             request_timeout: Duration::from_secs(30),
             launch_timeout: Duration::from_secs(60),
             enable_stealth: true,
+            tls_proxy: crate::tls_proxy::TlsProxyConfig::from_env(),
         }
     }
 }
@@ -168,6 +176,31 @@ impl CdpFetcher {
             .arg("--disable-features=IsolateOrigins,site-per-process")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-gpu");
+
+        // Inject TLS-impersonation proxy args when enabled. The proxy
+        // (a separate Go process) re-issues Chrome's HTTPS via
+        // bogdanfinn/tls-client with a byte-perfect browser ClientHello,
+        // which is what unlocks Cloudflare IUAM and similar
+        // fingerprint-sensitive challenges. `--ignore-certificate-errors`
+        // is required because the proxy presents per-host certs signed
+        // by its own dynamically-generated CA; Chrome would otherwise
+        // reject them. `--proxy-bypass-list` keeps intra-container
+        // traffic (the proxy itself, the crw-shield server) off the
+        // proxy to avoid a loop.
+        if let Some(proxy) = self.config.tls_proxy.as_ref() {
+            let listen_url = proxy.proxy_server_url();
+            info!(
+                listen = %listen_url,
+                profile = %proxy.profile,
+                bypass = %proxy.bypass,
+                "injecting TLS proxy args into chromiumoxide config"
+            );
+            builder = builder
+                .arg(format!("--proxy-server={}", listen_url))
+                .arg("--ignore-certificate-errors")
+                .arg(format!("--proxy-bypass-list={}", proxy.bypass));
+        }
+
         builder
             .build()
             .map_err(|e| CrwError::Fetch(format!("browser config: {e}")))

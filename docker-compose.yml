@@ -18,4 +18,24 @@ services:
       # SCRAPE_DELAY_PRESET=polite
       # CRAWL_MAX_CONCURRENCY=5
       # PROXY_URL=
+      # TLS-impersonation-proxy (opt-in, see crates/fetch/src/tls_proxy.rs).
+      # When TLS_PROXY_ENABLED=true, a Go sidecar (tls-impersonate-proxy)
+      # is spawned at startup; Chrome's HTTPS is routed through it with a
+      # byte-perfect browser TLS ClientHello (via bogdanfinn/tls-client).
+      # This unlocks Cloudflare IUAM and similar fingerprint-sensitive
+      # challenges. Default is OFF — vanilla BoringSSL fingerprint.
+      # - TLS_PROXY_ENABLED=false
+      # - TLS_PROXY_LISTEN=127.0.0.1:7890
+      # - TLS_PROXY_PROFILE=chrome_120
+      # - TLS_PROXY_CA_DIR=/var/lib/crw-shield/tls-ca
+      # - TLS_PROXY_BYPASS=localhost,127.0.0.1,::1
+      # - TLS_PROXY_TIMEOUT_SECS=60
+    volumes:
+      # Persistent CA dir for the TLS-impersonate-proxy (so the CA survives
+      # container restarts). Comment out the TLS_PROXY_* env vars above
+      # to disable the proxy entirely.
+      - crw-shield-tls-ca:/var/lib/crw-shield/tls-ca
     restart: unless-stopped
+
+volumes:
+  crw-shield-tls-ca:
