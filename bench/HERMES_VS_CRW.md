@@ -76,11 +76,28 @@ Hermes tronque probablement les pages au-delà d'une limite et fait du LLM-summa
 
 ## Verdict final
 
-**crw-shield rivalise avec Firecrawl self-hosted sur 80% des sites testés**, et le surpasse en raw content depth sur 9/20.
+**crw-shield rate son objectif principal.** Le projet a été conçu pour améliorer l'anti-bot de Firecrawl self-hosted (qui est notoirement faible sur DataDome/Cloudflare IUAM, surtout sans clé d'API commerciale). Le bench montre que **crw-shield fait exactement le même score que Firecrawl (16/20 = 80%)** et **échoue sur exactement les mêmes 4 sites durs** (Etsy, Leboncoin, StackOverflow, +1 variante).
 
-1. **Volume de contenu** : 9/20 sites où crw fait x1.5 à x14 plus de markdown que Firecrawl (média, anti-bot dur).
-2. **Anti-bot contournement** : 1 site (crates.io) où crw passe et Firecrawl échoue.
-3. **Fraîcheur** : crw fait du raw extraction, Firecrawl fait du LLM-summary tronqué.
+### Sur l'anti-bot (l'objectif principal) : ÉCHEC
+
+| Site | Firecrawl self-hosted | crw-shield |
+|---|---|---|
+| Etsy (DataDome captcha) | ❌ FAIL | ❌ FAIL |
+| Leboncoin (DataDome) | ❌ FAIL | ❌ FAIL |
+| StackOverflow (Cloudflare IUAM) | ❌ FAIL | ❌ FAIL |
+
+**Les 3 mêmes sites résistent aux deux.** L'anti-bot de crw-shield (FlareSolverr + chromium + JA3/JA4 + L0-L3 ladder) **n'apporte aucun gain** par rapport à Firecrawl sur ces cibles. Hypothèses sur pourquoi :
+- Firecrawl self-hosted utilise aussi FlareSolverr en interne
+- Le plafond DataDome/Cloudflare IUAM n'est pas une question de stack mais d'**IP de datacenter** — il faut des proxies résidentiels HEAVY
+- Le benchmark 15 sites précédent (73% sur 15) incluait `crates.io` que Firecrawl rate aussi — donc on n'a même pas débloqué de site en plus
+
+### Sur le raw content depth (détail, pas l'objectif) : gain marginal
+
+crw-shield produit jusqu'à 14x plus de markdown que Firecrawl sur certains sites (Wikipedia Rust, Le Monde, HackerNews). C'est parce que crw-shield fait du raw HTML→MD sans LLM-summary intermédiaire. Mais c'est **détail technique, pas valeur ajoutée** — l'user peut lui-même faire `head -c 50000` sur n'importe quel markdown Firecrawl.
+
+### Sur la vitesse : comparable
+
+Les temps de réponse sont dans le même ordre (~500ms-20s selon le site). Pas de gain mesurable.
 
 **Firecrawl est meilleur** sur :
 
@@ -93,7 +110,25 @@ Hermes tronque probablement les pages au-delà d'une limite et fait du LLM-summa
 
 ## Recommandation
 
-- **crw-shield est un remplacement viable de Firecrawl pour 80% des cas** — et meilleur en raw content depth.
-- **Firecrawl garde un avantage** sur les SPA React-like (reddit, twitter) grâce au LLM-summary.
-- **Stratégie hybride** : basculer le `web.backend` d'Hermes de `firecrawl` vers `crw-shield` pour les 80% où crw est meilleur, garder Firecrawl en fallback pour les SPA React. Coût : 0 (crw-shield est local OSS) vs abonnement Firecrawl ($).
-- **Sites dur (Etsy, Leboncoin, StackOverflow) :** ni crw-shield ni Firecrawl ne passent. Il faut HEAVY (proxies résidentiels) — c'est un plafond commun à tout l'écosystème.
+**crw-shield n'a pas atteint son objectif.** Trois options pour la suite :
+
+### Option 1 : accepter le plafond et documenter honnêtement
+- crw-shield = **clone Firecrawl en Rust** (compatible API, plus rapide à compiler, plus léger en RAM, raw content depth)
+- Anti-bot = même niveau que Firecrawl self-hosted (plafonné par l'IP datacenter)
+- Pour Etsy/Leboncoin/StackOverflow : il faut Firecrawl cloud ($$$) ou proxies résidentiels HEAVY ($50-200/mois)
+- **Utile si** : tu veux un binaire Rust 100% sous ton contrôle, sans Docker, sans Node.js, et que tu n'as pas besoin des 4 sites durs
+
+### Option 2 : pousser plus loin l'anti-bot (HEAVY)
+- Ajouter proxies résidentiels (rotation par site)
+- Ajouter stealth avancé : Camoufox / chrome-remote-interface avec scripts stealth
+- Implémenter le HITL fallback (humain résout les captchas)
+- Coût : $50-200/mois de proxies + 2-4 semaines de dev
+- Objectif : passer 22-23/25 sites au lieu de 16/20
+
+### Option 3 : pivoter le positionnement
+- crw-shield comme **alternative OSS légère à Firecrawl cloud** (raw content, compatible API v2)
+- Positionnement : "100% local, pas de quota, pas de coût récurrent, raw markdown"
+- Anti-bot = pas le différenciateur (c'est l'IP, pas le code)
+- **Utile si** : tu veux un service utilisable par d'autres devs, pas juste pour toi
+
+Ma recommandation : **Option 1 + documenter honnêtement**. crw-shield est un bon outil mais pas le game-changer que le nom suggère. Si tu veux le game-changer, c'est Option 2 (mais avec un budget).
