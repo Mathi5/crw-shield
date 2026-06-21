@@ -65,6 +65,20 @@ impl Default for CdpConfig {
     }
 }
 
+impl CdpConfig {
+    /// Build a `CdpConfig` whose chrome path is taken from `CHROME_PATH`
+    /// (if set) or `chrome_path_override` (if `Some`), in that order.
+    /// Convenience for callers that want to inject a path explicitly
+    /// without re-implementing the env-var lookup.
+    pub fn with_chrome_path(chrome_path_override: Option<PathBuf>) -> Self {
+        let mut cfg = Self::default();
+        if cfg.chrome_path.is_none() {
+            cfg.chrome_path = chrome_path_override;
+        }
+        cfg
+    }
+}
+
 /// Shared, lazily-initialised browser handle. The browser runs on its own
 /// background tokio task that owns the WS handler stream.
 struct Inner {
@@ -75,7 +89,11 @@ struct Inner {
 
 struct InnerSlot {
     inner: Option<Inner>,
-    init_attempted: bool,
+    /// Timestamp of the most recent failed init attempt, if any. We keep this
+    /// so we don't spin on a broken chromium binary (a hot retry loop would
+    /// cost ~60 s each), but we DO allow re-attempts: a previous failure does
+    /// not permanently poison the slot. See `get_or_init` for the retry policy.
+    last_init_failure: Option<std::time::Instant>,
 }
 
 /// CDP fetcher. Uses a single browser instance and one fresh page per fetch.
@@ -92,7 +110,7 @@ impl CdpFetcher {
             config,
             slot: Arc::new(Mutex::new(InnerSlot {
                 inner: None,
-                init_attempted: false,
+                last_init_failure: None,
             })),
             cookies: Arc::new(CookieJar::new()),
         }
@@ -110,7 +128,7 @@ impl CdpFetcher {
             config,
             slot: Arc::new(Mutex::new(InnerSlot {
                 inner: None,
-                init_attempted: false,
+                last_init_failure: None,
             })),
             cookies,
         }
@@ -156,26 +174,82 @@ impl CdpFetcher {
     }
 
     /// Get or initialise the browser.
+    ///
+    /// **Retry policy (LIGHT.1 fix)**: previously this method used a sticky
+    /// `init_attempted: bool` flag — the first `Browser::launch()` failure
+    /// permanently poisoned the slot, so every subsequent fetch returned the
+    /// generic "browser initialisation previously failed" error even after the
+    /// underlying issue (e.g. missing CHROME_PATH, transient container start
+    /// race) was fixed. That made the server un-recoverable until a restart.
+    ///
+    /// New policy:
+    ///   1. If the slot already holds a live browser, return it.
+    ///   2. Otherwise, attempt `Browser::launch(cfg)` up to **2 times** with
+    ///      a **2 s backoff** between attempts. Both failures emit the
+    ///      original chromiumoxide error (prefixed with "browser config: ")
+    ///      so operators can diagnose the real cause.
+    ///   3. If both attempts fail, record the failure timestamp on the slot
+    ///      and return the error. We do NOT cache the failure permanently:
+    ///      the next call after a short cooldown (`RETRY_COOLDOWN`) will be
+    ///      allowed to try again. That way a transient failure (container
+    ///      coming up, browser binary missing then installed, ...) self-heals
+    ///      without a server restart, but a genuinely broken setup doesn't
+    ///      burn a 60 s launch timeout on every request.
     async fn get_or_init<'a>(&'a self, slot: &'a mut InnerSlot) -> Result<&'a mut Browser> {
         if let Some(ref mut inner) = slot.inner {
             return Ok(&mut inner.browser);
         }
-        if slot.init_attempted {
-            return Err(CrwError::Fetch(
-                "browser initialisation previously failed".to_string(),
-            ));
+        // If the previous attempt failed recently, refuse to retry until the
+        // cooldown has elapsed — this avoids a hot loop on a broken binary.
+        const RETRY_COOLDOWN: Duration = Duration::from_secs(30);
+        if let Some(last) = slot.last_init_failure {
+            if last.elapsed() < RETRY_COOLDOWN {
+                return Err(CrwError::Fetch(
+                    "browser initialisation previously failed (retry cooldown)".to_string(),
+                ));
+            }
+            // Cooldown elapsed — allow another attempt. Clear the timestamp
+            // so a *fresh* failure re-arms the cooldown.
+            slot.last_init_failure = None;
         }
-        slot.init_attempted = true;
         let cfg = self.build_browser_config()?;
-        let (browser, mut handler) = Browser::launch(cfg)
-            .await
-            .map_err(|e| CrwError::Fetch(format!("browser launch: {e}")))?;
-        let handle = tokio::spawn(async move { while let Some(_msg) = handler.next().await {} });
-        slot.inner = Some(Inner {
-            browser,
-            _handler: Arc::new(handle),
-        });
-        Ok(&mut slot.inner.as_mut().unwrap().browser)
+        const MAX_ATTEMPTS: u32 = 2;
+        let mut last_err: Option<CrwError> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Browser::launch(cfg.clone()).await {
+                Ok((browser, mut handler)) => {
+                    let handle =
+                        tokio::spawn(async move { while let Some(_msg) = handler.next().await {} });
+                    slot.inner = Some(Inner {
+                        browser,
+                        _handler: Arc::new(handle),
+                    });
+                    return Ok(&mut slot.inner.as_mut().unwrap().browser);
+                }
+                Err(e) => {
+                    // Preserve the original chromiumoxide error message —
+                    // operators need to see e.g. "Could not find chrome" or
+                    // "Connection refused", not a generic wrapper.
+                    let crw_err = CrwError::Fetch(format!("browser config: {e}"));
+                    warn!(
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        "Browser::launch failed"
+                    );
+                    last_err = Some(crw_err);
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+        // Both attempts failed — record the timestamp so the next caller
+        // hits the cooldown rather than retrying immediately.
+        slot.last_init_failure = Some(std::time::Instant::now());
+        Err(last_err.unwrap_or_else(|| {
+            CrwError::Fetch("browser initialisation failed (unknown reason)".to_string())
+        }))
     }
 
     /// Open a new page, install the stealth script, navigate, run actions,

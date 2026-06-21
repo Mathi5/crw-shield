@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crw_antibot::{DelayPreset, HostCounters};
 use crw_core::Config;
-use crw_fetch::{CdpFetcher, FetchLadder, FlareSolverrClient, HttpFetcher};
+use crw_fetch::{CdpConfig, CdpFetcher, FetchLadder, FlareSolverrClient, HttpFetcher};
 
 use crate::handlers::CrawlJob;
 
@@ -31,7 +31,19 @@ impl AppState {
                 .expect("failed to build HttpFetcher"),
         );
         let cdp = if config.cdp_enabled {
-            Some(Arc::new(CdpFetcher::with_default()))
+            // FIX 3 (MEDIUM.2): explicitly thread the chrome path through.
+            // `CdpConfig::default()` already reads CHROME_PATH from env, so
+            // when the Dockerfile sets `ENV CHROME_PATH=/usr/bin/chromium`
+            // the fetcher will pick it up. We also log the resolved path so
+            // operators can verify the container picked the right binary.
+            let cdp_cfg = CdpConfig::with_chrome_path(None);
+            tracing::info!(
+                cdp_enabled = config.cdp_enabled,
+                chrome_path = ?cdp_cfg.chrome_path,
+                headless = cdp_cfg.headless,
+                "building CDP fetcher"
+            );
+            Some(Arc::new(CdpFetcher::new(cdp_cfg)))
         } else {
             None
         };

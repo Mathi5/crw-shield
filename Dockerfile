@@ -22,14 +22,32 @@ COPY crates/ crates/
 # like a real browser to Akamai/DataDome/Cloudflare.
 RUN cargo build --release --features crw-fetch/tls-fingerprint
 
-# Runtime stage
-FROM debian:bookworm-slim
+# Runtime stage — installs the system chromium binary and its dependencies
+# so the CDP fetcher can launch a real browser inside the container.
+#
+# We use Debian's `chromium` package (NOT chrome from Google) — this is
+# FOSS, ships with all the libraries the browser needs, and works on
+# bookworm without an extra apt source. The CHROME_PATH env var points
+# the Rust code at the right binary.
+FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    chromium \
+    chromium-driver \
+    fonts-liberation \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm1 \
+    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/crw-server /usr/local/bin/crw-server
+
+# Tell the CDP fetcher where to find the chromium binary. `CdpConfig::default`
+# already reads this env var (see crates/fetch/src/cdp.rs).
+ENV CHROME_PATH=/usr/bin/chromium
 
 EXPOSE 3002
 

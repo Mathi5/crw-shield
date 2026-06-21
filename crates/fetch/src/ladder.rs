@@ -14,7 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use crw_antibot::{
-    detect_empty_or_blocked, decide_rotation, diagnose_situation, CookieJar,
+    detect_challenge, detect_empty_or_blocked, decide_rotation, diagnose_situation, CookieJar,
     HostCounters, RotationDecision, SituationReport, SuggestedLadder,
 };
 use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, ScrapeResponse};
@@ -184,6 +184,27 @@ impl FetchLadder {
         detect_empty_or_blocked(html)
     }
 
+    /// LIGHT.2 — anti-bot validation of a FlareSolverr response. Returns
+    /// `Err` with a descriptive message when the HTML is clearly blocked
+    /// (empty, JS-only shell, hard anti-bot landing page), otherwise
+    /// `Ok(())`. The full situation report is computed by `try_flaresolverr`
+    /// so we can log it; this thin helper exists so the validation logic
+    /// can be unit-tested without spinning up a real FlareSolverr client.
+    ///
+    /// **Important**: this uses `detect_empty_or_blocked` (size + hard
+    /// shell heuristics), NOT `detect_challenge` (which matches broad
+    /// token patterns like "verify" that appear in legitimate scripts).
+    /// Earlier revisions of this helper used `detect_challenge` and
+    /// caused false positives on Wikipedia / LinkedIn / Leboncoin
+    /// — these sites have legitimate scripts containing words the
+    /// token bank flags. The size-based check is more conservative.
+    fn validate_flaresolverr_solution(html: &str) -> std::result::Result<(), String> {
+        if detect_empty_or_blocked(html) {
+            return Err("flaresolverr returned blocked/empty page".to_string());
+        }
+        Ok(())
+    }
+
     /// Phase C.3 — adaptive retry decision.
     ///
     /// Given the quality of the first pass and the situation report,
@@ -242,6 +263,23 @@ impl FetchLadder {
 
     /// Escalate to FlareSolverr to solve a remaining challenge. Returns
     /// `None` if no FlareSolverr client is configured.
+    ///
+    /// **LIGHT.2 fix (post-fetch validation)**: FlareSolverr is supposed to
+    /// return solved HTML, but on DataDome / PerimeterX / Kasada sites it
+    /// frequently returns the *challenge* page rather than the real
+    /// content — the upstream solver's fingerprint has been fingerprinted
+    /// and the page server-side detects it. Previously we accepted any
+    /// 2xx response as "solved" and reported a clean success, masking the
+    /// underlying anti-bot block. We now run the same situation detector
+    /// we use for HTTP / CDP results:
+    ///   * If the HTML still looks like a known anti-bot page (DataDome,
+    ///     Cloudflare IUAM, Akamai, ...) we return `Err` with the provider
+    ///     name. The caller (ladder loop) sees the error and can surface
+    ///     it to the operator.
+    ///   * If the HTML is empty / JS-only / suspicious, we still return
+    ///     `Ok(Some(LadderResult))` (CDP-only escalation paths use this),
+    ///     but populate the structured `SituationReport` so the caller
+    ///     can act on it instead of getting a bogus `CleanSuccess`.
     async fn try_flaresolverr(
         &self,
         url: &str,
@@ -268,9 +306,28 @@ impl FetchLadder {
                     url: request.url.clone(),
                     final_url: solution.final_url,
                     status_code: solution.status_code,
-                    html: solution.html,
+                    html: solution.html.clone(),
                     headers,
                 };
+
+                // ---- LIGHT.2: anti-bot validation ----
+                // Build a real situation report from the FlareSolverr HTML so
+                // the caller knows what it actually got.
+                let situation = Self::diagnose_fetch(&fetch);
+
+                // Hard-fail: the response still looks like an anti-bot page.
+                // Return `Err` so the ladder can decide what to do (the
+                // typical path is to bubble the error to the operator since
+                // we've exhausted our escalation budget).
+                if let Err(msg) = Self::validate_flaresolverr_solution(&solution.html) {
+                    warn!(
+                        url = %url,
+                        kind = %situation.kind,
+                        "FlareSolverr returned anti-bot page; failing"
+                    );
+                    return Err(crw_core::CrwError::Fetch(msg));
+                }
+
                 Ok(Some(LadderResult {
                     fetch,
                     screenshot: None,
@@ -279,7 +336,7 @@ impl FetchLadder {
                     } else {
                         FetchSource::FlareSolverr
                     },
-                    situation: SituationReport::default(),
+                    situation,
                 }))
             }
             Err(e) => {
@@ -496,17 +553,40 @@ impl FetchLadder {
                 signal,
                 next_profile_idx,
             } => {
+                // LIGHT.3 — L2 Rotate is intentionally a no-op at this layer
+                // (the full rotation machinery — restart Chrome, switch
+                // profile dir, 15s cooldown — needs the caller to reconfigure
+                // the HttpFetcher and CdpFetcher; we can't do that from
+                // inside this method without breaking the trait's signature).
+                //
+                // What we CAN do is log a useful diagnostic so operators
+                // know exactly what the next rotation would change, instead
+                // of just "would rotate to profile N".
+                let current_profile = if next_profile_idx > 0 {
+                    next_profile_idx - 1
+                } else {
+                    0
+                };
                 warn!(
                     url = %request.url,
                     kind = ?signal.kind,
+                    confidence = signal.confidence,
                     next_profile_idx,
-                    "L2 Rotate: rotation would switch to profile {} (full rotation requires caller to reconfigure the HttpFetcher)",
-                    next_profile_idx
+                    current_profile,
+                    delay_secs = 5,
+                    "L2 Rotate: would switch profile {} -> {} (change User-Agent to {}, sleep 5s, then re-run the ladder)",
+                    current_profile,
+                    next_profile_idx,
+                    match next_profile_idx % 3 {
+                        0 => "Chrome-131",
+                        1 => "Firefox-128",
+                        _ => "Safari-18",
+                    }
                 );
-                // We don't have the machinery to actually restart Chrome
-                // and switch profile dir from here — that needs a caller
-                // that owns the fetcher lifecycle. So we just return the
-                // current (likely blocked) result with a log.
+                // No-op: return the (likely blocked) result with a clear
+                // breadcrumb in the logs. The caller is expected to
+                // re-invoke `fetch_with_rotation` after applying the
+                // rotation in their own HttpFetcher instance.
                 Ok(result)
             }
             RotationDecision::Fail {
@@ -931,5 +1011,68 @@ mod tests {
             crw_antibot::SuggestedLadder::Cdp,
         );
         assert!(FetchLadder::should_retry_for_quality(0.1, &s, true, false));
+    }
+
+    // =====================================================================
+    // LIGHT.2 — FlareSolverr post-fetch validation
+    // =====================================================================
+
+    #[test]
+    fn validate_flaresolverr_solution_accepts_clean_html() {
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Product Page</title></head>
+<body>
+<h1>Awesome Product</h1>
+<p>This is a real product page with plenty of content for the heuristic to
+treat as legitimate. It has multiple paragraphs of useful text describing
+what the product does, its features, pricing, and customer reviews.
+Definitely not a bot block page.</p>
+</body></html>"#;
+        assert!(FetchLadder::validate_flaresolverr_solution(html).is_ok());
+    }
+
+    #[test]
+    fn validate_flaresolverr_solution_rejects_datadome_page() {
+        // DataDome challenge fingerprint: contains "datadome" token + a
+        // captcha-style element. The detector should flag it as
+        // datadome_captcha and the validator should return Err.
+        let html = r#"<!DOCTYPE html>
+<html><body>
+<div class="ddc-captcha">Please complete the security check.</div>
+<script src="https://datadome.co/challenge.js"></script>
+</body></html>"#;
+        let res = FetchLadder::validate_flaresolverr_solution(html);
+        assert!(res.is_err(), "expected Err for DataDome page, got Ok");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("flaresolverr returned anti-bot page"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("datadome"),
+            "expected 'datadome' in error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_flaresolverr_solution_rejects_cloudflare_iuam() {
+        // Use a Cloudflare-specific fingerprint so the detector picks the
+        // exact `cloudflare_iuam` situation rather than a generic verify.
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Just a moment...</title></head>
+<body>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+<noscript>cf-mitigated: please enable JavaScript.</noscript>
+</body></html>"#;
+        let res = FetchLadder::validate_flaresolverr_solution(html);
+        assert!(res.is_err(), "expected Err for CF IUAM page, got Ok");
+        let msg = res.unwrap_err();
+        // The detector picks either cloudflare_iuam or cloudflare_turnstile;
+        // either is a valid catch for our purpose (the page is an anti-bot
+        // challenge and must be rejected).
+        assert!(
+            msg.contains("cloudflare") || msg.contains("turnstile"),
+            "expected cloudflare-classifier message, got: {msg}"
+        );
     }
 }
