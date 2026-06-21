@@ -119,6 +119,31 @@ impl CookieJar {
         guard.cookies.retain(|_, bucket| !bucket.is_empty());
     }
 
+    /// Drop every cookie stored for `host` and all of its parent domains
+    /// (`sub.example.com`, `example.com`, `com`).
+    ///
+    /// Called by the L1 (ClearAndRetry) handler in the ladder when a site
+    /// returns a block on the first attempt — clearing stale cookies
+    /// (e.g. a `cf_clearance` that expired, a DataDome token that was
+    /// blacklisted) is a cheap way to retry without rotating the whole
+    /// browser identity.
+    ///
+    /// Returns the number of cookies removed (useful for telemetry).
+    pub fn clear_for_host(&self, host: &str) -> usize {
+        let normalized = normalize_host(host);
+        let mut guard = self.inner.lock().expect("cookie jar mutex poisoned");
+        let mut removed = 0usize;
+        for h in host_candidates(&normalized) {
+            if let Some(bucket) = guard.cookies.get_mut(&h) {
+                removed += bucket.len();
+                bucket.clear();
+            }
+        }
+        // Also remove now-empty buckets from the outer map.
+        guard.cookies.retain(|_, bucket| !bucket.is_empty());
+        removed
+    }
+
     /// Total number of cookies currently stored (including expired ones that
     /// have not yet been swept by `clear_expired`). Mostly useful for tests.
     #[cfg(test)]
@@ -349,5 +374,54 @@ mod tests {
         // the manual fallback.
         let header = jar.cookie_header_for("example.com/foo");
         assert_eq!(header.as_deref(), Some("x=1"));
+    }
+
+    #[test]
+    fn clear_for_host_removes_host_and_parents() {
+        let jar = CookieJar::new();
+        jar.set_cookie("example.com", "root", "1", None);
+        jar.set_cookie("sub.example.com", "sub", "2", None);
+        jar.set_cookie("other.com", "leave", "3", None);
+        let removed = jar.clear_for_host("sub.example.com");
+        // `sub.example.com` had 1, `example.com` (parent) had 1 = 2 total.
+        assert_eq!(removed, 2);
+        // `other.com` should be untouched.
+        let other_header = jar.cookie_header_for("https://other.com/").unwrap();
+        assert_eq!(other_header, "leave=3");
+        // Both sub.* and root cookies should be gone.
+        assert!(jar.cookie_header_for("https://sub.example.com/").is_none());
+        assert!(jar.cookie_header_for("https://example.com/").is_none());
+    }
+
+    #[test]
+    fn clear_for_host_returns_zero_when_nothing_to_clear() {
+        let jar = CookieJar::new();
+        jar.set_cookie("other.com", "x", "1", None);
+        let removed = jar.clear_for_host("example.com");
+        assert_eq!(removed, 0);
+        // `other.com` cookie still there.
+        let h = jar.cookie_header_for("https://other.com/").unwrap();
+        assert_eq!(h, "x=1");
+    }
+
+    #[test]
+    fn clear_for_host_clears_multiple_cookies_on_same_host() {
+        let jar = CookieJar::new();
+        jar.set_cookie("example.com", "cf_clearance", "abc", None);
+        jar.set_cookie("example.com", "__cf_bm", "xyz", None);
+        jar.set_cookie("example.com", "datadome", "dd", None);
+        let removed = jar.clear_for_host("example.com");
+        assert_eq!(removed, 3);
+        assert!(jar.cookie_header_for("https://example.com/").is_none());
+    }
+
+    #[test]
+    fn clear_for_host_is_idempotent() {
+        let jar = CookieJar::new();
+        jar.set_cookie("example.com", "x", "1", None);
+        assert_eq!(jar.clear_for_host("example.com"), 1);
+        // Second call on a now-empty jar returns 0 (no panic, no overflow).
+        assert_eq!(jar.clear_for_host("example.com"), 0);
+        assert!(jar.cookie_header_for("https://example.com/").is_none());
     }
 }

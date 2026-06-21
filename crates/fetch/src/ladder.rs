@@ -590,16 +590,19 @@ impl FetchLadder {
         match decision {
             RotationDecision::Accept => Ok(result),
             RotationDecision::ClearAndRetry { signal } => {
+                let removed = self.cookies.clear_for_host(&host);
                 info!(
                     url = %request.url,
                     kind = ?signal.kind,
                     confidence = signal.confidence,
-                    "L1 ClearAndRetry: sleeping 1s and retrying (cookie clear is TODO: requires CookieJar API extension)"
+                    cookies_cleared = removed,
+                    "L1 ClearAndRetry: cleared cookies for host, sleeping 1s and retrying"
                 );
-                // NOTE: ideally we'd call `self.cookies.clear_for_host(&host)`
-                // here, but CookieJar doesn't expose that method yet. We
-                // still sleep + retry: clearing-cookies is a "best effort"
-                // optimization, not a correctness fix.
+                // Cookie-clear is the cheap first-line retry: many stale
+                // cookie blocks (`cf_clearance` expired, DataDome
+                // blacklisted) resolve this way without needing a full
+                // TLS profile rotation. Sleep a tick so the upstream
+                // rate-limit window resets, then re-run the fetch.
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 result = self.fetch(request).await?;
                 Ok(result)

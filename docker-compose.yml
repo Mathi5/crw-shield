@@ -28,7 +28,7 @@ services:
       # the proxy and respawns it with the next profile in
       # TLS_PROXY_PROFILES (default: chrome_120, chrome_117, chrome_107,
       # firefox_117, safari_16_0). 5 profiles × 1 retry = up to 10
-      # attempts before HITL fallback.
+      # 5 profiles × 1 retry = up to 10 attempts before HITL fallback.
       - TLS_PROXY_ENABLED=false
       - TLS_PROXY_LISTEN=127.0.0.1:7890
       - TLS_PROXY_PROFILE=chrome_120
