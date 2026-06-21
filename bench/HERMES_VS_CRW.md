@@ -7,9 +7,9 @@
 
 ## Méthodologie
 
-- **Hermes** : `web_extract(urls=[...])` — tool natif Hermes qui fait du fetch + extraction markdown. **Backend réel** : **Firecrawl commercial** (`~/.hermes/config.yaml` ligne 53 : `web.backend: firecrawl`). Le message d'erreur vu sur Etsy/Leboncoin/StackOverflow (`"Internal Server Error: Failed to scrape. Scrape aborted after exceeding retry limit (document_antibot)"`) est la **signature du SDK Firecrawl** quand un site déclenche leur classification `document_antibot` après N retries.
+- **Hermes** : `web_extract(urls=[...])` — tool natif Hermes qui fait du fetch + extraction markdown. **Backend réel** : **Firecrawl auto-hébergé** sur `http://192.168.1.101:3002` (`~/.hermes/.env` : `FIRECRAWL_API_URL=http://192.168.1.101:3002`, `~/.hermes/config.yaml` ligne 53 : `web.backend: firecrawl`). Le message d'erreur vu sur Etsy/Leboncoin/StackOverflow (`"Internal Server Error: Failed to scrape. Scrape aborted after exceeding retry limit (document_antibot)"`) est la **signature du SDK Firecrawl** quand un site déclenche leur classification `document_antibot` après N retries. **Note** : c'est l'instance **self-hosted** de l'utilisateur (réponse `{"message":"Firecrawl API","documentation_url":"https://docs.firecrawl.dev"}`), pas le service commercial `api.firecrawl.dev`.
 - **crw-shield** : `POST /v2/scrape` (binaire Rust 100% OSS local, image 1.28 GB).
-- **Comparaison réelle** : **Firecrawl commercial ($/mois, infra anti-bot pro) vs crw-shield OSS (gratuit, code maison)**.
+- **Comparaison réelle** : **Firecrawl self-hosted (TypeScript, infra anti-bot pro, image Docker officielle) vs crw-shield OSS (Rust, code maison)**. Deux stacks complètement différentes sur le même réseau LAN.
 - **20 sites** répartis en 5 catégories : simple (5), média (5), e-commerce (4), anti-bot dur (4), tech (2).
 
 ## Tableau A/B
@@ -76,7 +76,7 @@ Hermes tronque probablement les pages au-delà d'une limite et fait du LLM-summa
 
 ## Verdict final
 
-**crw-shield rivalise avec Firecrawl commercial sur 80% des sites testés**, et le surpasse en raw content depth sur 9/20.
+**crw-shield rivalise avec Firecrawl self-hosted sur 80% des sites testés**, et le surpasse en raw content depth sur 9/20.
 
 1. **Volume de contenu** : 9/20 sites où crw fait x1.5 à x14 plus de markdown que Firecrawl (média, anti-bot dur).
 2. **Anti-bot contournement** : 1 site (crates.io) où crw passe et Firecrawl échoue.
