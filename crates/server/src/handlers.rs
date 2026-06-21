@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -133,6 +133,52 @@ async fn handle_hitl_enqueue(
     })
 }
 
+/// GET /v2/scrape/hitl/result?id=<uuid>
+///
+/// Reads back the current state of a HITL queue entry. Returns the entry
+/// (with `status`, `cookies`, etc.) when found, or 404 when the id is
+/// unknown. The caller is expected to poll this until `status` flips to
+/// `solved`, then take the `cookies` and retry the original /v2/scrape
+/// request with those cookies attached.
+pub async fn hitl_result(
+    State(state): State<AppState>,
+    Query(params): Query<HitlResultQuery>,
+) -> impl IntoResponse {
+    let resp = handle_hitl_result(&state, &params.id);
+    match resp {
+        Ok(entry) => (StatusCode::OK, Json(entry)).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"success": false, "error": e})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HitlResultQuery {
+    pub id: String,
+}
+
+fn handle_hitl_result(_state: &AppState, id: &str) -> Result<serde_json::Value, String> {
+    let queue_path = PathBuf::from(HITL_QUEUE_PATH);
+    let content = std::fs::read_to_string(&queue_path)
+        .map_err(|e| format!("read queue file {}: {e}", queue_path.display()))?;
+    // Find the line whose `id` field matches the requested id. NDJSON
+    // means we walk line by line and parse each as JSON.
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("parse queue entry: {e}"))?;
+        if entry.get("id").and_then(|v| v.as_str()) == Some(id) {
+            return Ok(entry);
+        }
+    }
+    Err(format!("HITL queue entry {id} not found"))
+}
+
 pub async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok","version": env!("CARGO_PKG_VERSION")}))
 }
@@ -169,6 +215,60 @@ async fn handle_scrape(
 
     let fetch_result = ladder_result.fetch;
     let situation = ladder_result.situation;
+
+    // HITL auto-trigger: if the ladder returned a response that is still
+    // an anti-bot block after exhausting L1 (ClearAndRetry) and L2
+    // (Rotate), enqueue a HITL request so a human can solve the
+    // challenge externally. We return an `Err` with code `HITL_REQUIRED`
+    // and embed the queue id + instructions in the error metadata so
+    // the caller can poll for the solution.
+    if situation.is_anti_bot() {
+        let challenge_kind = situation.kind.as_str().to_string();
+        warn!(
+            url = %url,
+            kind = %challenge_kind,
+            "L3 Fail: ladder exhausted; auto-enqueueing HITL request"
+        );
+        match handle_hitl_enqueue(
+            &state,
+            HitlRequest {
+                url: url.clone(),
+                challenge_kind: Some(challenge_kind.clone()),
+                note: Some(format!(
+                    "auto-triggered after ladder exhausted L1+L2 (situation={challenge_kind})"
+                )),
+            },
+        )
+        .await
+        {
+            Ok(hitl_resp) => {
+                let instructions = format!(
+                    "anti-bot challenge ({challenge_kind}) not solved automatically; \
+                     open the URL in a browser, solve the challenge, then call \
+                     GET /v2/scrape/hitl/result?id={} to retrieve the cookies, \
+                     and retry the original /v2/scrape with those cookies.",
+                    hitl_resp.id
+                );
+                // Build a structured ErrorResponse with the HITL payload
+                // embedded in the error metadata. The scrape() wrapper
+                // surfaces this as a 503 to the caller.
+                let mut err = ErrorResponse::new("HITL_REQUIRED", instructions);
+                err.details = Some(json!({
+                    "hitl_id": hitl_resp.id,
+                    "queue_file": hitl_resp.queue_file,
+                    "challenge_kind": challenge_kind,
+                    "url": url,
+                    "created_at": hitl_resp.created_at,
+                    "instructions": hitl_resp.instructions,
+                }));
+                return Err(err);
+            }
+            Err(e) => {
+                error!(error = %e, "failed to auto-enqueue HITL request");
+                // Fall through to the regular CHALLENGE_DETECTED path.
+            }
+        }
+    }
 
     if !state.config.cdp_enabled {
         if let Some(challenge) = detect_challenge(&fetch_result.html) {
@@ -267,6 +367,7 @@ fn status_for_code(code: &str) -> StatusCode {
     match code {
         "INVALID_URL" => StatusCode::BAD_REQUEST,
         "CHALLENGE_DETECTED" => StatusCode::FORBIDDEN,
+        "HITL_REQUIRED" => StatusCode::SERVICE_UNAVAILABLE,
         "NOT_IMPLEMENTED" => StatusCode::NOT_IMPLEMENTED,
         "NOT_FOUND" => StatusCode::NOT_FOUND,
         "HTTP_ERROR" => StatusCode::BAD_GATEWAY,

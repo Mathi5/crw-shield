@@ -74,6 +74,23 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often we poll the listen port while waiting for readiness.
 pub const READY_POLL: Duration = Duration::from_millis(100);
 
+/// Default rotation ladder — order matters. We start with the profile
+/// most likely to match the user agent Chrome advertises, then walk
+/// older versions of Chrome (less data on Cloudflare's side), then jump
+/// to Firefox (completely different TLS shape) and Safari (yet another
+/// shape). 5 profiles × 1 retry each = up to 10 attempts before HITL.
+///
+/// The skill (`rust-anti-scraping-bypass/references/reactive-profile-rotation.md`)
+/// recommends 3-5 profiles max — beyond that, the rotated profile is
+/// so old that its TLS shape is itself a fingerprint signal.
+pub const DEFAULT_PROFILES: &[&str] = &[
+    "chrome_120",  // baseline — matches the chromium binary in the image
+    "chrome_117",  // 3 minor versions older — different TLS extensions
+    "chrome_107",  // ~2 years older — Cloudflare has less data here
+    "firefox_117", // completely different TLS shape (no X25519Kyber768)
+    "safari_16_0", // yet another shape (different ALPN, cipher order)
+];
+
 /// Configuration for spawning the tls-impersonate-proxy sidecar.
 #[derive(Debug, Clone)]
 pub struct TlsProxyConfig {
@@ -81,8 +98,17 @@ pub struct TlsProxyConfig {
     pub binary: PathBuf,
     /// Listen address (`host:port`). Default `127.0.0.1:7890`.
     pub listen: String,
-    /// TLS profile name. Default `chrome_120`.
+    /// Initial TLS profile (the one used at startup). The runtime
+    /// rotation ladder may swap this out — see `profiles`.
     pub profile: String,
+    /// Full rotation ladder — tried in order on each anti-bot block.
+    /// First element should equal `profile` (or the runtime will skip
+    /// the initial profile silently). Empty = no rotation (vanilla).
+    pub profiles: Vec<String>,
+    /// Backoff between rotation attempts. The skill recommends 15s;
+    /// shorter (2-5s) is fine for self-hosted but slightly increases
+    /// the chance of being rate-limited by the target.
+    pub rotation_delay: Duration,
     /// Persistent CA dir. CA is loaded if it exists, generated if not.
     pub ca_dir: PathBuf,
     /// Comma-separated hosts to forward as a raw tunnel (no MITM).
@@ -99,7 +125,9 @@ impl TlsProxyConfig {
     /// - `TLS_PROXY_ENABLED`       — `"true"`/`"1"` to enable (required)
     /// - `TLS_PROXY_BINARY`        — path to the binary (default `/usr/local/bin/tls-impersonate-proxy`)
     /// - `TLS_PROXY_LISTEN`        — listen address (default `127.0.0.1:7890`)
-    /// - `TLS_PROXY_PROFILE`       — TLS profile (default `chrome_120`)
+    /// - `TLS_PROXY_PROFILE`       — initial TLS profile (default `chrome_120`)
+    /// - `TLS_PROXY_PROFILES`      — rotation ladder, comma-separated (default: full `DEFAULT_PROFILES` ladder)
+    /// - `TLS_PROXY_ROTATION_DELAY_SECS` — backoff between rotations (default `15`, `0` to disable)
     /// - `TLS_PROXY_CA_DIR`        — CA dir (default `/var/lib/crw-shield/tls-ca`)
     /// - `TLS_PROXY_BYPASS`        — bypass list (default `localhost,127.0.0.1,::1`)
     /// - `TLS_PROXY_TIMEOUT_SECS`  — per-request timeout secs (default `60`)
@@ -125,6 +153,45 @@ impl TlsProxyConfig {
             .ok()
             .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
 
+        // If the operator gave us a CSV ladder, use it as-is. Otherwise
+        // fall back to the default ladder with the initial profile as
+        // the first entry. An empty TLS_PROXY_PROFILES means "no
+        // rotation" — only the initial profile is ever tried.
+        let profiles = std::env::var("TLS_PROXY_PROFILES")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| {
+                DEFAULT_PROFILES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
+
+        // Make sure the initial profile is at index 0 of the ladder.
+        // If the operator set both TLS_PROXY_PROFILE=firefox_120 and
+        // TLS_PROXY_PROFILES=chrome_120,chrome_117, the operator-set
+        // profile wins and we prepend it.
+        let profiles = if profiles.first().map(String::as_str) != Some(profile.as_str()) {
+            let mut p = vec![profile.clone()];
+            p.extend(profiles);
+            p
+        } else {
+            profiles
+        };
+
+        let rotation_delay = std::env::var("TLS_PROXY_ROTATION_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(15));
+
         let ca_dir = std::env::var("TLS_PROXY_CA_DIR")
             .ok()
             .map(PathBuf::from)
@@ -144,6 +211,8 @@ impl TlsProxyConfig {
             binary,
             listen,
             profile,
+            profiles,
+            rotation_delay,
             ca_dir,
             bypass,
             timeout,
@@ -174,6 +243,9 @@ impl TlsProxyConfig {
 /// `kill()` on a panic will still reap the zombie.
 pub struct TlsProxy {
     child: Arc<Mutex<Option<Child>>>,
+    /// The profile the proxy is CURRENTLY running. Starts at index 0
+    /// of `config.profiles`. Updated by `rotate()`.
+    current_profile: Arc<Mutex<String>>,
     config: TlsProxyConfig,
 }
 
@@ -196,35 +268,22 @@ impl TlsProxy {
             ))
         })?;
 
+        let initial = config
+            .profiles
+            .first()
+            .cloned()
+            .unwrap_or_else(|| config.profile.clone());
+
         info!(
             binary = %config.binary.display(),
             listen = %config.listen,
-            profile = %config.profile,
+            profile = %initial,
+            ladder = ?config.profiles,
             ca_dir = %config.ca_dir.display(),
             "spawning tls-impersonate-proxy"
         );
 
-        let mut child = Command::new(&config.binary)
-            .arg("-listen")
-            .arg(&config.listen)
-            .arg("-profile")
-            .arg(&config.profile)
-            .arg("-ca-dir")
-            .arg(&config.ca_dir)
-            .arg("-bypass")
-            .arg(&config.bypass)
-            .arg("-timeout")
-            .arg(format!("{}s", config.timeout.as_secs()))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                CrwError::Fetch(format!(
-                    "failed to spawn tls-impersonate-proxy at {}: {e}",
-                    config.binary.display()
-                ))
-            })?;
+        let mut child = Self::spawn_with_profile(&config, &initial).await?;
 
         // Poll the listen port for readiness. The Go binary binds almost
         // immediately (< 1s), but bogdanfinn/tls-client init can take
@@ -259,8 +318,152 @@ impl TlsProxy {
 
         Ok(Self {
             child: Arc::new(Mutex::new(Some(child))),
+            current_profile: Arc::new(Mutex::new(initial)),
             config,
         })
+    }
+
+    /// Internal: spawn the binary with a specific profile name. Used by
+    /// both the initial `spawn` and by `rotate()` when we swap profiles.
+    async fn spawn_with_profile(
+        config: &TlsProxyConfig,
+        profile: &str,
+    ) -> Result<Child> {
+        Command::new(&config.binary)
+            .arg("-listen")
+            .arg(&config.listen)
+            .arg("-profile")
+            .arg(profile)
+            .arg("-ca-dir")
+            .arg(&config.ca_dir)
+            .arg("-bypass")
+            .arg(&config.bypass)
+            .arg("-timeout")
+            .arg(format!("{}s", config.timeout.as_secs()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                CrwError::Fetch(format!(
+                    "failed to spawn tls-impersonate-proxy at {}: {e}",
+                    config.binary.display()
+                ))
+            })
+    }
+
+    /// The TLS profile the proxy is CURRENTLY serving. Read-only — to
+    /// rotate, call `rotate()` which will SIGKILL the child and start a
+    /// new one with the next profile in the ladder.
+    pub async fn current_profile(&self) -> String {
+        self.current_profile.lock().await.clone()
+    }
+
+    /// Returns the next profile in the rotation ladder, or `None` if
+    /// the ladder is exhausted (caller should fall back to HITL).
+    pub async fn next_profile(&self) -> Option<String> {
+        let current = self.current_profile.lock().await.clone();
+        let next = self
+            .config
+            .profiles
+            .iter()
+            .skip_while(|p| p.as_str() != current.as_str())
+            .nth(1)
+            .cloned();
+        next
+    }
+
+    /// True if there is at least one untried profile in the ladder.
+    pub async fn has_next_profile(&self) -> bool {
+        self.next_profile().await.is_some()
+    }
+
+    /// Rotate to the next profile in the ladder: kill the current
+    /// child, spawn a new one with the next profile, wait for
+    /// readiness. Returns `Ok(Some(new_profile))` on success,
+    /// `Ok(None)` if the ladder is exhausted (caller falls back to
+    /// HITL), or `Err` if the new child fails to start.
+    ///
+    /// Honors `config.rotation_delay` before the new child spawns
+    /// (the skill recommends 15s; the env can override). Set to 0
+    /// to skip the delay (useful in tests).
+    pub async fn rotate(&self) -> Result<Option<String>> {
+        let next = match self.next_profile().await {
+            Some(n) => n,
+            None => {
+                warn!("tls-impersonate-proxy rotation ladder exhausted");
+                return Ok(None);
+            }
+        };
+
+        if !self.config.rotation_delay.is_zero() {
+            info!(
+                backoff = ?self.config.rotation_delay,
+                next = %next,
+                "rotating tls-impersonate-proxy profile"
+            );
+            tokio::time::sleep(self.config.rotation_delay).await;
+        }
+
+        // Kill the current child. Take it out of the Option so a second
+        // concurrent rotate doesn't double-spawn.
+        {
+            let mut guard = self.child.lock().await;
+            if let Some(mut old) = guard.take() {
+                let _ = old.kill().await;
+                let _ = old.wait().await;
+            }
+        }
+
+        // Spawn the new child.
+        let mut new_child = Self::spawn_with_profile(&self.config, &next).await?;
+
+        // Wait for readiness (shorter poll than initial — Go binary
+        // is hot in cache by now).
+        let port = self.config.port().ok_or_else(|| {
+            CrwError::Fetch(format!(
+                "invalid tls-proxy listen address: {}",
+                self.config.listen
+            ))
+        })?;
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = new_child.kill().await;
+                let _ = new_child.wait().await;
+                return Err(CrwError::Fetch(format!(
+                    "tls-impersonate-proxy (profile={next}) did not open {} within {:?}",
+                    self.config.listen, READY_TIMEOUT
+                )));
+            }
+            if let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                drop(stream);
+                break;
+            }
+            if let Ok(Some(status)) = new_child.try_wait() {
+                return Err(CrwError::Fetch(format!(
+                    "tls-impersonate-proxy (profile={next}) exited prematurely: {status}"
+                )));
+            }
+            tokio::time::sleep(READY_POLL).await;
+        }
+
+        // Store the new child + update current profile.
+        {
+            let mut guard = self.child.lock().await;
+            *guard = Some(new_child);
+        }
+        {
+            let mut cp = self.current_profile.lock().await;
+            *cp = next.clone();
+        }
+
+        info!(
+            profile = %next,
+            "tls-impersonate-proxy rotated to new profile"
+        );
+
+        Ok(Some(next))
     }
 
     /// SIGKILL the child process. Idempotent: a second call on an
@@ -324,6 +527,8 @@ mod tests {
             binary: PathBuf::from("/bin/x"),
             listen: "127.0.0.1:7890".into(),
             profile: "chrome_120".into(),
+            profiles: vec!["chrome_120".into()],
+            rotation_delay: Duration::from_secs(15),
             ca_dir: PathBuf::from("/tmp/ca"),
             bypass: DEFAULT_BYPASS.into(),
             timeout: DEFAULT_TIMEOUT,
@@ -338,10 +543,103 @@ mod tests {
             binary: PathBuf::from("/bin/x"),
             listen: "[::1]:7890".into(),
             profile: "chrome_120".into(),
+            profiles: vec!["chrome_120".into()],
+            rotation_delay: Duration::from_secs(15),
             ca_dir: PathBuf::from("/tmp/ca"),
             bypass: DEFAULT_BYPASS.into(),
             timeout: DEFAULT_TIMEOUT,
         };
         assert_eq!(cfg.port(), Some(7890));
+    }
+
+    #[test]
+    fn default_ladder_has_five_profiles() {
+        assert_eq!(DEFAULT_PROFILES.len(), 5);
+        assert_eq!(DEFAULT_PROFILES[0], "chrome_120");
+        assert_eq!(DEFAULT_PROFILES[1], "chrome_117");
+        assert_eq!(DEFAULT_PROFILES[2], "chrome_107");
+        assert_eq!(DEFAULT_PROFILES[3], "firefox_117");
+        assert_eq!(DEFAULT_PROFILES[4], "safari_16_0");
+    }
+
+    #[test]
+    fn custom_ladder_via_env() {
+        unsafe {
+            std::env::set_var("TLS_PROXY_ENABLED", "true");
+            std::env::set_var("TLS_PROXY_PROFILES", "firefox_117,firefox_120");
+        }
+        let cfg = TlsProxyConfig::from_env().expect("should be enabled");
+        // The initial profile (default chrome_120) is prepended because
+        // the CSV ladder didn't start with it.
+        assert_eq!(cfg.profiles, vec![
+            "chrome_120".to_string(),
+            "firefox_117".to_string(),
+            "firefox_120".to_string(),
+        ]);
+        unsafe {
+            std::env::remove_var("TLS_PROXY_ENABLED");
+            std::env::remove_var("TLS_PROXY_PROFILES");
+        }
+    }
+
+    #[test]
+    fn custom_ladder_prepends_initial_profile() {
+        unsafe {
+            std::env::set_var("TLS_PROXY_ENABLED", "true");
+            std::env::set_var("TLS_PROXY_PROFILE", "firefox_123");
+            std::env::set_var("TLS_PROXY_PROFILES", "chrome_120,chrome_117");
+        }
+        let cfg = TlsProxyConfig::from_env().expect("should be enabled");
+        // Initial profile is firefox_123 — prepended to the CSV ladder.
+        assert_eq!(cfg.profiles, vec![
+            "firefox_123".to_string(),
+            "chrome_120".to_string(),
+            "chrome_117".to_string(),
+        ]);
+        unsafe {
+            std::env::remove_var("TLS_PROXY_ENABLED");
+            std::env::remove_var("TLS_PROXY_PROFILE");
+            std::env::remove_var("TLS_PROXY_PROFILES");
+        }
+    }
+
+    #[test]
+    fn empty_ladder_disables_rotation() {
+        unsafe {
+            std::env::set_var("TLS_PROXY_ENABLED", "true");
+            std::env::set_var("TLS_PROXY_PROFILES", "");
+        }
+        let cfg = TlsProxyConfig::from_env().expect("should be enabled");
+        // Empty CSV → fall back to DEFAULT_PROFILES (full ladder).
+        assert_eq!(cfg.profiles.len(), DEFAULT_PROFILES.len());
+        unsafe {
+            std::env::remove_var("TLS_PROXY_ENABLED");
+            std::env::remove_var("TLS_PROXY_PROFILES");
+        }
+    }
+
+    #[test]
+    fn rotation_delay_default_15s() {
+        unsafe {
+            std::env::set_var("TLS_PROXY_ENABLED", "true");
+            std::env::remove_var("TLS_PROXY_ROTATION_DELAY_SECS");
+        }
+        let cfg = TlsProxyConfig::from_env().expect("should be enabled");
+        assert_eq!(cfg.rotation_delay, Duration::from_secs(15));
+        unsafe { std::env::remove_var("TLS_PROXY_ENABLED") };
+    }
+
+    #[test]
+    fn rotation_delay_override() {
+        unsafe {
+            std::env::set_var("TLS_PROXY_ENABLED", "true");
+            std::env::set_var("TLS_PROXY_ROTATION_DELAY_SECS", "0");
+        }
+        let cfg = TlsProxyConfig::from_env().expect("should be enabled");
+        assert_eq!(cfg.rotation_delay, Duration::from_secs(0));
+        unsafe {
+            std::env::remove_var("TLS_PROXY_ENABLED");
+            std::env::remove_var("TLS_PROXY_ROTATION_DELAY_SECS");
+        }
     }
 }

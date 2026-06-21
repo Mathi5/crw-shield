@@ -90,7 +90,10 @@ impl AppState {
             },
             _ => None,
         };
-        let ladder = Arc::new(FetchLadder::new(http, cdp, flaresolverr));
+        let ladder = Arc::new(
+            FetchLadder::new(http, cdp, flaresolverr)
+                .with_tls_proxy_opt(tls_proxy.clone()),
+        );
         Self {
             config: Arc::new(config),
             ladder,
@@ -135,7 +138,9 @@ impl AppState {
             },
             _ => None,
         };
-        let ladder = Arc::new(FetchLadder::new(http, cdp, flaresolverr));
+        let ladder = Arc::new(
+            FetchLadder::new(http, cdp, flaresolverr).with_tls_proxy_opt(None),
+        );
         Self {
             config: Arc::new(config),
             ladder,

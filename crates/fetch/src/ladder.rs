@@ -14,8 +14,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use crw_antibot::{
-    detect_challenge, detect_empty_or_blocked, decide_rotation, diagnose_situation, CookieJar,
-    HostCounters, RotationDecision, SituationReport, SuggestedLadder,
+    counter_for_host as counter_for, detect_challenge, detect_empty_or_blocked, decide_rotation,
+    diagnose_situation, CookieJar, HostCounters, L2_COOLDOWN, RotationDecision, SituationReport,
+    SuggestedLadder,
 };
 use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, ScrapeResponse};
 use tracing::{debug, info, warn};
@@ -23,6 +24,7 @@ use tracing::{debug, info, warn};
 use crate::cdp::{CdpFetchResult, CdpFetcher};
 use crate::flaresolverr::FlareSolverrClient;
 use crate::http::{FetchResult, Fetcher, HttpFetcher};
+use crate::tls_proxy::TlsProxy;
 
 /// Outcome of a ladder attempt — what backend served the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +67,10 @@ pub struct FetchLadder {
     cdp: Option<Arc<CdpFetcher>>,
     flaresolverr: Option<Arc<FlareSolverrClient>>,
     cookies: Arc<CookieJar>,
+    /// Optional handle to the `tls-impersonate-proxy` sidecar. When set,
+    /// the L2 rotation path will SIGKILL the proxy and respawn it with
+    /// the next profile in the ladder before retrying the fetch.
+    tls_proxy: Option<Arc<TlsProxy>>,
 }
 
 impl FetchLadder {
@@ -82,7 +88,30 @@ impl FetchLadder {
             cdp,
             flaresolverr,
             cookies,
+            tls_proxy: None,
         }
+    }
+
+    /// Attach a `tls-impersonate-proxy` handle. Returns `Self` for chaining.
+    /// When set, the L2 rotation in `fetch_with_rotation` will swap the
+    /// proxy's TLS profile before retrying.
+    pub fn with_tls_proxy(mut self, tls_proxy: Arc<TlsProxy>) -> Self {
+        self.tls_proxy = Some(tls_proxy);
+        self
+    }
+
+    /// Variant of `with_tls_proxy` that accepts `Option<Arc<TlsProxy>>`.
+    /// A no-op when `tls_proxy` is `None`. Convenient for `AppState`
+    /// wiring where the proxy is conditionally spawned.
+    pub fn with_tls_proxy_opt(mut self, tls_proxy: Option<Arc<TlsProxy>>) -> Self {
+        self.tls_proxy = tls_proxy;
+        self
+    }
+
+    /// Borrow the TLS proxy handle (if any). Used by callers that want
+    /// to read the current profile or trigger an out-of-band rotation.
+    pub fn tls_proxy(&self) -> Option<&Arc<TlsProxy>> {
+        self.tls_proxy.as_ref()
     }
 
     /// Construct a ladder that shares one cookie jar between the HTTP and
@@ -112,6 +141,7 @@ impl FetchLadder {
             cdp,
             flaresolverr,
             cookies,
+            tls_proxy: None,
         })
     }
 
@@ -578,15 +608,66 @@ impl FetchLadder {
                 signal,
                 next_profile_idx,
             } => {
-                // LIGHT.3 — L2 Rotate is intentionally a no-op at this layer
-                // (the full rotation machinery — restart Chrome, switch
-                // profile dir, 15s cooldown — needs the caller to reconfigure
-                // the HttpFetcher and CdpFetcher; we can't do that from
-                // inside this method without breaking the trait's signature).
-                //
-                // What we CAN do is log a useful diagnostic so operators
-                // know exactly what the next rotation would change, instead
-                // of just "would rotate to profile N".
+                // L2: kill the tls-impersonate-proxy (if enabled), respawn
+                // it on the next profile, sleep the L2 cooldown, then
+                // re-run the ladder. This is the side-effect that
+                // `fetch_with_rotation` previously only logged.
+                if let Some(proxy) = &self.tls_proxy {
+                    // Cooldown BEFORE rotation (the skill recommends
+                    // waiting 15s to simulate a device switch on the
+                    // user's side). The proxy's own rotation_delay is
+                    // additive on top of this if set.
+                    let proxy_profile_before = proxy.current_profile().await;
+                    info!(
+                        url = %request.url,
+                        kind = ?signal.kind,
+                        confidence = signal.confidence,
+                        current_profile = %proxy_profile_before,
+                        next_profile_idx,
+                        cooldown_secs = L2_COOLDOWN.as_secs(),
+                        "L2 Rotate: rotating tls-impersonate-proxy profile"
+                    );
+                    tokio::time::sleep(L2_COOLDOWN).await;
+                    match proxy.rotate().await {
+                        Ok(Some(new_profile)) => {
+                            info!(
+                                old_profile = %proxy_profile_before,
+                                new_profile = %new_profile,
+                                "L2 Rotate: tls-impersonate-proxy rotated; retrying fetch"
+                            );
+                        }
+                        Ok(None) => {
+                            warn!(
+                                "L2 Rotate: rotation ladder exhausted; returning current result with breadcrumb"
+                            );
+                            // The ladder has no more profiles to try. We
+                            // return the current (likely blocked) result
+                            // and let the caller decide — usually that
+                            // means surfacing the 403/503 to the user.
+                            return Ok(result);
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "L2 Rotate: tls-impersonate-proxy rotation failed; returning current result"
+                            );
+                            return Ok(result);
+                        }
+                    }
+                    // Record the rotation on the per-host counter so
+                    // repeated blocks on the same host eventually trip L3.
+                    counter_for(&host, host_counters).record_rotation();
+                    result = self.fetch(request).await?;
+                    // Re-evaluate the freshly-rendered response. If it's
+                    // still a block, the outer loop (the caller's
+                    // invocation) decides whether to escalate further.
+                    return Ok(result);
+                }
+
+                // No TLS proxy attached — fall back to the historical
+                // log-only diagnostic. The full rotation machinery
+                // (restart Chrome, switch profile dir) is still out of
+                // scope for this method without a proxy.
                 let current_profile = if next_profile_idx > 0 {
                     next_profile_idx - 1
                 } else {
@@ -599,7 +680,7 @@ impl FetchLadder {
                     next_profile_idx,
                     current_profile,
                     delay_secs = 5,
-                    "L2 Rotate: would switch profile {} -> {} (change User-Agent to {}, sleep 5s, then re-run the ladder)",
+                    "L2 Rotate: would switch profile {} -> {} (change User-Agent to {}, sleep 5s, then re-run the ladder; no tls-impersonate-proxy attached — set TLS_PROXY_ENABLED=true for full rotation)",
                     current_profile,
                     next_profile_idx,
                     match next_profile_idx % 3 {
@@ -608,10 +689,6 @@ impl FetchLadder {
                         _ => "Safari-18",
                     }
                 );
-                // No-op: return the (likely blocked) result with a clear
-                // breadcrumb in the logs. The caller is expected to
-                // re-invoke `fetch_with_rotation` after applying the
-                // rotation in their own HttpFetcher instance.
                 Ok(result)
             }
             RotationDecision::Fail {

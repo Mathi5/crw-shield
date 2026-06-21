@@ -24,12 +24,19 @@ services:
       # byte-perfect browser TLS ClientHello (via bogdanfinn/tls-client).
       # This unlocks Cloudflare IUAM and similar fingerprint-sensitive
       # challenges. Default is OFF — vanilla BoringSSL fingerprint.
-      # - TLS_PROXY_ENABLED=false
-      # - TLS_PROXY_LISTEN=127.0.0.1:7890
-      # - TLS_PROXY_PROFILE=chrome_120
-      # - TLS_PROXY_CA_DIR=/var/lib/crw-shield/tls-ca
-      # - TLS_PROXY_BYPASS=localhost,127.0.0.1,::1
-      # - TLS_PROXY_TIMEOUT_SECS=60
+      # Rotation ladder: when a block is detected, the L2 handler kills
+      # the proxy and respawns it with the next profile in
+      # TLS_PROXY_PROFILES (default: chrome_120, chrome_117, chrome_107,
+      # firefox_117, safari_16_0). 5 profiles × 1 retry = up to 10
+      # attempts before HITL fallback.
+      - TLS_PROXY_ENABLED=false
+      - TLS_PROXY_LISTEN=127.0.0.1:7890
+      - TLS_PROXY_PROFILE=chrome_120
+      - TLS_PROXY_PROFILES=chrome_120,chrome_117,chrome_107,firefox_117,safari_16_0
+      - TLS_PROXY_ROTATION_DELAY_SECS=15
+      - TLS_PROXY_CA_DIR=/var/lib/crw-shield/tls-ca
+      - TLS_PROXY_BYPASS=localhost,127.0.0.1,::1
+      - TLS_PROXY_TIMEOUT_SECS=60
     volumes:
       # Persistent CA dir for the TLS-impersonate-proxy (so the CA survives
       # container restarts). Comment out the TLS_PROXY_* env vars above
