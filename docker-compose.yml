@@ -37,12 +37,21 @@ services:
       - TLS_PROXY_CA_DIR=/var/lib/crw-shield/tls-ca
       - TLS_PROXY_BYPASS=localhost,127.0.0.1,::1
       - TLS_PROXY_TIMEOUT_SECS=60
+      # Phase 2 — profile warming. Setting CRW_PROFILE_DIR enables
+      # persistent Chrome profile + 4-URL warmup on first launch
+      # (Cookies/History/Cache seeded to look "lived-in" to anti-bot
+      # heuristics). Without this, the profile is in-memory and warming
+      # is skipped. See crates/fetch/src/cdp.rs::warmup_profile.
+      - CRW_PROFILE_DIR=/var/lib/crw-shield/profile
     volumes:
       # Persistent CA dir for the TLS-impersonate-proxy (so the CA survives
       # container restarts). Comment out the TLS_PROXY_* env vars above
       # to disable the proxy entirely.
       - crw-shield-tls-ca:/var/lib/crw-shield/tls-ca
+      # Persistent Chrome profile dir so warming + cookies survive restarts.
+      - crw-shield-profile:/var/lib/crw-shield/profile
     restart: unless-stopped
 
 volumes:
   crw-shield-tls-ca:
+  crw-shield-profile:
