@@ -207,6 +207,13 @@ async fn handle_scrape(
 
     info!(url = %url, "scrape request");
 
+    // Phase 3 — per-server rate limiter. Adds min_interval + random jitter
+    // between consecutive scrapes to avoid hammering upstream rate-limits
+    // (Cloudflare, DataDome, etc.). First call is instant, subsequent calls
+    // wait `RATE_LIMIT_MIN_MS` (default 2000) + random 0..`RATE_LIMIT_JITTER_MS`
+    // (default 500). Set either to 0 to disable. See `crate::rate_limit`.
+    state.rate_limiter.wait().await;
+
     let ladder_result = state
         .ladder
         .fetch_with_rotation(&req, &state.host_counters)

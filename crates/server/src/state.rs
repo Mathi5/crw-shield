@@ -25,6 +25,11 @@ pub struct AppState {
     /// Held in `AppState` so the proxy is kept alive for the lifetime of
     /// the server. `None` when `TLS_PROXY_ENABLED` is not set.
     pub tls_proxy: Option<Arc<TlsProxy>>,
+    /// Per-server rate limiter (min interval + random jitter). Defaults
+    /// to 2000 ms + 500 ms (configurable via `RATE_LIMIT_MIN_MS` and
+    /// `RATE_LIMIT_JITTER_MS`). Set both to 0 to disable. See
+    /// `crate::rate_limit::RateLimiter`.
+    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 }
 
 impl AppState {
@@ -101,6 +106,7 @@ impl AppState {
             jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             host_counters: Arc::new(Mutex::new(HashMap::new())),
             tls_proxy,
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_env()),
         }
     }
 
@@ -148,6 +154,7 @@ impl AppState {
             jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             host_counters: Arc::new(Mutex::new(HashMap::new())),
             tls_proxy: None,
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_env()),
         }
     }
 }

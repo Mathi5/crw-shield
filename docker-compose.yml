@@ -37,21 +37,32 @@ services:
       - TLS_PROXY_CA_DIR=/var/lib/crw-shield/tls-ca
       - TLS_PROXY_BYPASS=localhost,127.0.0.1,::1
       - TLS_PROXY_TIMEOUT_SECS=60
-      # Phase 2 — profile warming. Setting CRW_PROFILE_DIR enables
-      # persistent Chrome profile + 4-URL warmup on first launch
-      # (Cookies/History/Cache seeded to look "lived-in" to anti-bot
-      # heuristics). Without this, the profile is in-memory and warming
-      # is skipped. See crates/fetch/src/cdp.rs::warmup_profile.
-      - CRW_PROFILE_DIR=/var/lib/crw-shield/profile
+      # Phase 2 — profile warming. **DISABLED by default** (see
+      # CRW_WARMUP_ENABLED below). Setting CRW_PROFILE_DIR creates a
+      # persistent Chrome profile that conflicts with chromiumoxide's
+      # Browser lifecycle — see `crates/fetch/src/cdp.rs::warmup_profile`
+      # for the full rationale. To enable in production, the Browser
+      # must be spawned ephemerally for warmup (separate process) then
+      # killed before the real Browser::launch. Not done yet.
+      # - CRW_PROFILE_DIR=/var/lib/crw-shield/profile
+      - CRW_WARMUP_ENABLED=false
+      # Phase 3 — rate limiter (min interval + random jitter between
+      # consecutive scrapes). 2000ms min + 500ms jitter matches
+      # cortex-bridge's defaults. Set both to 0 to disable entirely.
+      # Note: for benchmarks, set jitter low or 0 to avoid 20-30s extra
+      # wait on 9-site sequential panels.
+      - RATE_LIMIT_MIN_MS=0
+      - RATE_LIMIT_JITTER_MS=0
     volumes:
       # Persistent CA dir for the TLS-impersonate-proxy (so the CA survives
       # container restarts). Comment out the TLS_PROXY_* env vars above
       # to disable the proxy entirely.
       - crw-shield-tls-ca:/var/lib/crw-shield/tls-ca
-      # Persistent Chrome profile dir so warming + cookies survive restarts.
-      - crw-shield-profile:/var/lib/crw-shield/profile
+      # Persistent Chrome profile dir — UNCOMMENT WITH CRW_PROFILE_DIR above
+      # to re-enable profile warming. Off until chromiumoxide Browser lifecycle
+      # is fixed (SingletonLock leaks across Browser::launch calls).
+      # - crw-shield-profile:/var/lib/crw-shield/profile
     restart: unless-stopped
 
 volumes:
   crw-shield-tls-ca:
-  crw-shield-profile:

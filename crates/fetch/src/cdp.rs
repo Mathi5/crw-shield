@@ -20,7 +20,7 @@ use crw_antibot::{stealth_script, CookieJar};
 use crw_core::{BrowserAction, CrwError, Result, ScrapeRequest};
 use futures::StreamExt;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::http::{FetchResult, Fetcher};
@@ -276,10 +276,33 @@ impl CdpFetcher {
                     // Cache so anti-bot heuristics see a "lived-in" profile).
                     // Best-effort: any failure here is logged but does not
                     // block the first fetch — see `warmup_profile`.
-                    if let Err(e) =
-                        Self::warmup_profile(&browser, self.config.user_data_dir.as_deref()).await
+                    //
+                    // **OFF by default**: enabling it from the same Browser
+                    // handle leaves a `SingletonLock` on the profile dir, which
+                    // causes every subsequent `Browser::launch` (on retry or
+                    // re-init) to fail with "profile in use by another
+                    // Chromium process" until the container is restarted.
+                    // Opt in with `CRW_WARMUP_ENABLED=true` — but only if you
+                    // understand the lifecycle (one-shot daemon, no hot
+                    // reload of profile state).
+                    if std::env::var("CRW_WARMUP_ENABLED")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false)
                     {
-                        warn!(error = %e, "profile warmup returned error (continuing)");
+                        if let Err(e) = Self::warmup_profile(
+                            &browser,
+                            self.config.user_data_dir.as_deref(),
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "profile warmup returned error (continuing)");
+                        }
+                    } else {
+                        debug!(
+                            user_data_dir = ?self.config.user_data_dir,
+                            "profile warmup skipped (CRW_WARMUP_ENABLED not set; \
+                             use `true` to enable on a dedicated daemon)"
+                        );
                     }
                     slot.inner = Some(Inner {
                         browser,
