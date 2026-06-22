@@ -42,9 +42,14 @@ jobs:
       - name: Test
         run: cargo test --all --locked
 
-  # Build the release binary for 4 platforms in parallel.
-  # `cross` is used for non-native triples (musl targets need it; we use
-  # gnu here for glibc compat, which works on stock Ubuntu runners).
+  # Build the release binary for 3 targets in parallel.
+  # - linux x86_64: native cargo build
+  # - linux aarch64: cargo build --target with the rustup target
+  #   (works on Ubuntu runners without needing cross/Docker-in-Docker;
+  #    BoringSSL/wreq builds natively for aarch64-linux-gnu)
+  # - macOS: deferred to v0.2.0 (BoringSSL/cmake toolchain on the
+  #   macOS GitHub runner needs a setup step that is non-trivial to
+  #   get right — see the v0.1.0 release notes for details).
   build:
     name: Build binary (${{ matrix.target }})
     needs: test
@@ -59,12 +64,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: crw-shield-linux-aarch64.tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: crw-shield-darwin-x86_64.tar.gz
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: crw-shield-darwin-aarch64.tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: crw-shield-linux-x86_64-musl.tar.gz
 
     steps:
       - name: Checkout
@@ -80,18 +82,28 @@ jobs:
         with:
           workspaces: "."
 
-      - name: Install cross (for non-native triples)
-        if: matrix.os == 'ubuntu-latest' && matrix.target != 'x86_64-unknown-linux-gnu'
-        run: cargo install cross --locked
+      - name: Install build dependencies (BoringSSL/wreq)
+        if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential pkg-config libclang-dev perl \
+            gcc-aarch64-linux-gnu \
+            musl-tools
 
       - name: Build release binary
         shell: bash
         run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
-            cargo build --release --target ${{ matrix.target }} --features crw-fetch/tls-fingerprint --locked
-          else
-            cross build --release --target ${{ matrix.target }} --features crw-fetch/tls-fingerprint --locked
+          set -euo pipefail
+          RUSTFLAGS=""
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            RUSTFLAGS="-C target-feature=+crt-static"
           fi
+          RUSTFLAGS="$RUSTFLAGS" cargo build \
+            --release \
+            --target ${{ matrix.target }} \
+            --features crw-fetch/tls-fingerprint \
+            --locked
 
       - name: Strip binary
         shell: bash
@@ -102,7 +114,7 @@ jobs:
             ls -la target/${{ matrix.target }}/release/
             exit 1
           fi
-          strip "$BINARY"
+          strip "$BINARY" || true
           ls -la "$BINARY"
 
       - name: Package archive
@@ -124,7 +136,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Publish the GitHub Release with all 4 archives attached.
+  # Publish the GitHub Release with all archives attached.
   release:
     name: GitHub Release
     needs: build
@@ -150,12 +162,13 @@ jobs:
           files: |
             dist/crw-shield-linux-x86_64.tar.gz/crw-shield-linux-x86_64.tar.gz
             dist/crw-shield-linux-aarch64.tar.gz/crw-shield-linux-aarch64.tar.gz
-            dist/crw-shield-darwin-x86_64.tar.gz/crw-shield-darwin-x86_64.tar.gz
-            dist/crw-shield-darwin-aarch64.tar.gz/crw-shield-darwin-aarch64.tar.gz
+            dist/crw-shield-linux-x86_64-musl.tar.gz/crw-shield-linux-x86_64-musl.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Build and push the Docker image to GHCR.
+  # linux/amd64 only for v0.1.0 (multi-arch is blocked on the same
+  # QEMU/builder setup as the macOS builds; tracked for v0.2.0).
   docker:
     name: Docker image
     needs: test
@@ -164,18 +177,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Extract version
         id: version
@@ -186,7 +196,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
             ghcr.io/Mathi5/crw-shield:${{ steps.version.outputs.VERSION }}
