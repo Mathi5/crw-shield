@@ -37,6 +37,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per `Article` / `Doc` page (v3 pre-pass + Firecrawl re-parse).
   `Product` / `Forum` are bit-identical to v3, confirming the router.
 
+### Fixed
+- **Phase D.1 (situation-aware routing)**: `extract_main_content_v4`
+  now consults the upstream `SituationReport` before delegating to
+  Firecrawl. When `situation.kind.is_anti_bot()` is true (Cloudflare
+  IUAM, DataDome, Kasada, Akamai, PerimeterX, etc.), Firecrawl is
+  bypassed and v3's situation-aware result is returned. This prevents
+  Firecrawl from extracting the challenge page itself as if it were
+  content (which happened with perimeterx-demo in the v0.1.0 bench).
+
+### Bench (30-site panel, real network, post-D.1)
+- **Headline**: wikipedia +370% bytes and +5× quality score vs
+  v3; twitter +3.5× quality; cloudflare.com +10× quality at 50%
+  the bytes (Firecrawl noise filtering); bbc-news and lemonde
+  bit-identical (v3 already optimal).
+- **Anti-bot correctly bypassed**: perimeterx-demo no longer returns
+  153 bytes of challenge-page garbage extracted by Firecrawl — it
+  now escalates to `HITL_REQUIRED` like every other anti-bot site.
+- **Aggregate** (23 sites OK in both v0.1.0 baseline and v4d):
+  +32.5% bytes, **+33% mean quality score** (0.198 → 0.263).
+- Caveats: bench binaire ran on host with `CHROME_PATH=/snap/bin/chromium`
+  and local FS/CDP ladder (no FlareSolverr/TLS proxy like the docker
+  build), so a few Tier 3 sites appear as `HITL_REQUIRED` on the host
+  where the docker v0.1.0 baseline succeeded. This is an environment
+  difference, not a Phase D.1 regression.
+
 ## [0.1.0] - 2026-06-22
 
 First public release.
