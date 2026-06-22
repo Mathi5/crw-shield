@@ -142,7 +142,10 @@ fn micro_bench_v3_vs_v4() {
         ("forum", FORUM_HTML),
     ];
 
-    println!("\n{:<10} {:<10} {:<10} {:<10} {:<10}", "fixture", "extractor", "ms", "bytes", "quality");
+    println!(
+        "\n{:<10} {:<10} {:<10} {:<10} {:<10}",
+        "fixture", "extractor", "ms", "bytes", "quality"
+    );
     println!("{}", "-".repeat(60));
 
     for (name, html) in fixtures {
@@ -162,7 +165,11 @@ fn micro_bench_v3_vs_v4() {
         let v3_result = extract_main_content_v3(html, None);
         println!(
             "{:<10} {:<10} {:<10.3} {:<10} {:<10.2}",
-            name, "v3", v3_ms, v3_result.result.markdown.len(), v3_result.result.quality
+            name,
+            "v3",
+            v3_ms,
+            v3_result.result.markdown.len(),
+            v3_result.result.quality
         );
 
         // v4
@@ -174,7 +181,11 @@ fn micro_bench_v3_vs_v4() {
         let v4_result = extract_main_content_v4(html, None, url);
         println!(
             "{:<10} {:<10} {:<10.3} {:<10} {:<10.2}",
-            name, "v4", v4_ms, v4_result.result.markdown.len(), v4_result.result.quality
+            name,
+            "v4",
+            v4_ms,
+            v4_result.result.markdown.len(),
+            v4_result.result.quality
         );
     }
 }

@@ -22,7 +22,15 @@ COPY crates/ crates/
 # in production: wreq/BoringSSL gives us byte-perfect Chrome 131/130/128/124,
 # Firefox 128/133 and Safari 18 TLS ClientHello + HTTP/2 SETTINGS so we look
 # like a real browser to Akamai/DataDome/Cloudflare.
-RUN cargo build --release --features crw-fetch/tls-fingerprint
+#
+# `firecrawl-extractor` is also opt-in: enables the 5-stage Firecrawl
+# html-extractor pipeline (Apache-2.0) for Article/Doc page types via
+# `extract_main_content_v4`. Off by default for the lean build. We enable
+# it here because real Article pages (Wikipedia, blogs, news) benefit from
+# the upstream pipeline's scoring weights.
+RUN cargo build --release \
+    --features crw-fetch/tls-fingerprint \
+    --features crw-extract/firecrawl-extractor
 
 # ---- Go tls-impersonate-proxy builder ---------------------------------------
 # Builds the MITM TLS-impersonation proxy as a sidecar binary. The proxy is

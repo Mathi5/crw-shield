@@ -140,7 +140,9 @@ mod tests {
     fn extract_with_firecrawl_stub_returns_none_without_feature() {
         // Without the feature, the wrapper is a no-op stub.
         #[cfg(not(feature = "firecrawl-extractor"))]
-        assert!(extract_with_firecrawl("<html><body><p>hi</p></body></html>", "https://x").is_none());
+        assert!(
+            extract_with_firecrawl("<html><body><p>hi</p></body></html>", "https://x").is_none()
+        );
     }
 
     #[cfg(feature = "firecrawl-extractor")]
@@ -184,20 +186,32 @@ mod tests {
             "#;
             let res = extract_with_firecrawl(html, "https://example.com/test")
                 .expect("html-extractor should be enabled and HTML is valid");
-            assert!(res.markdown.contains("Hello World"), "missing H1: {}", res.markdown);
+            assert!(
+                res.markdown.contains("Hello World"),
+                "missing H1: {}",
+                res.markdown
+            );
             assert!(
                 res.markdown.contains("main content"),
                 "missing article body: {}",
                 res.markdown
             );
             // Footer/nav should be stripped by the 5-stage pipeline.
-            assert!(!res.markdown.contains("Nav junk"), "nav leaked: {}", res.markdown);
+            assert!(
+                !res.markdown.contains("Nav junk"),
+                "nav leaked: {}",
+                res.markdown
+            );
             assert!(
                 !res.markdown.contains("Footer junk"),
                 "footer leaked: {}",
                 res.markdown
             );
-            assert!(res.quality > 0.0, "quality should be > 0, got {}", res.quality);
+            assert!(
+                res.quality > 0.0,
+                "quality should be > 0, got {}",
+                res.quality
+            );
         }
 
         #[test]

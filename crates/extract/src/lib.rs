@@ -17,6 +17,6 @@ pub use markdown::html_to_markdown;
 pub use metadata::extract_metadata;
 // Phase D: re-export the wrapper. `map_page_type` is feature-gated; we
 // provide a stub for the no-feature build so call sites compile either way.
-pub use firecrawl_compat::{extract_with_firecrawl, reason_from_quality};
 #[cfg(feature = "firecrawl-extractor")]
 pub use firecrawl_compat::map_page_type;
+pub use firecrawl_compat::{extract_with_firecrawl, reason_from_quality};
