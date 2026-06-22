@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Firecrawl html-extractor (5-stage pipeline, page-type-aware scoring).
+# Off by default — adds ~30s to build, ~5MB to binary.
+# Enable with: cargo build --features firecrawl-extractor
+firecrawl-extractor = ["dep:html-extractor"]
+
 [dependencies]
 crw-core = { path = "../core" }
 # Phase C: situation-aware extraction (`extract_main_content_v3`).
@@ -16,3 +22,7 @@ htmd = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+# Phase D: Firecrawl html-extractor (5-stage pipeline). Optional, feature-gated.
+# Pinned to commit 0a2b743 (last main commit as of Jun 22 2026; no semver
+# tags published yet by upstream). See NOTICE for Apache-2.0 attribution.
+html-extractor = { git = "https://github.com/firecrawl/html-extractor", rev = "0a2b7432a20e356c2254f17e1b0acb2e79d88917", optional = true }
