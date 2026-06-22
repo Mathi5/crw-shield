@@ -155,6 +155,13 @@ pub enum PageType {
     Forum,
     /// API / technical documentation — heavy code blocks, table of contents.
     Doc,
+    /// Phase D: homepage-style aggregator (added to match Firecrawl's
+    /// `Collection` variant). Falls back to v3 noise filtering like `Listing`.
+    Collection,
+    /// Phase D: marketing, pricing, contact, terms-of-service pages
+    /// (added to match Firecrawl's `Service` variant). These are usually
+    /// mostly boilerplate; v3 returns whatever article-like content exists.
+    Service,
     /// Cannot be classified confidently.
     #[default]
     Unknown,
@@ -898,6 +905,13 @@ fn score_quality(html: &str, text_len: usize, page_type: PageType) -> f32 {
         PageType::Product => 0.9,
         PageType::Forum => 0.85,
         PageType::Listing => 0.7,
+        // Phase D: Collection (homepage aggregator) gets the same conservative
+        // weight as Listing (mostly card grids, low prose density).
+        PageType::Collection => 0.7,
+        // Service pages (marketing, pricing, contact) are usually 80%
+        // boilerplate — slightly lower weight, v3 noise filter will still
+        // pick out any embedded article-like content.
+        PageType::Service => 0.75,
         PageType::Unknown => 0.8,
     };
 
