@@ -163,3 +163,29 @@ jobs:
             ghcr.io/mathi5/crw-shield:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Make GHCR package public
+        # The GHCR image is MIT-licensed; no need to keep it private. Public
+        # visibility lets Runtipi (and anyone else) pull the image without
+        # configuring a GHCR_PAT. Idempotent — re-running on the same package
+        # is a no-op.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: crw-shield
+        run: |
+          set -euo pipefail
+          status=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
+            --jq '.visibility // empty')
+          if [ "${status}" != "public" ]; then
+            echo "Package visibility: ${status:-unknown} -> setting to public"
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
+              -f visibility=public
+          else
+            echo "Package already public, skipping"
+          fi
