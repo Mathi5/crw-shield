@@ -43,6 +43,41 @@ table and `bench/A_B_30SITE_BENCH.md` for the A/B comparison against
 - **Residential-IP friendly** — works with cheap or free residential proxies
   because the browser profile, TLS fingerprint, and HTTP/2 SETTINGS are
   consistent with a real browser
+- **Page-type-aware extraction** (Phase D) — `extract_main_content_v4`
+  routes `Article` and `Doc` pages through a 5-stage extraction
+  pipeline (pre-clean → classify → score → fallback → render) with
+  page-type-aware scoring weights. Optional Cargo feature
+  `crw-extract/firecrawl-extractor` enables the upstream
+  [firecrawl/html-extractor](https://github.com/firecrawl/html-extractor)
+  (Apache-2.0) for that path. Off by default — zero impact on the
+  default build.
+
+## Extraction pipeline
+
+`crw-shield` exposes a Firecrawl v2-compatible `POST /v2/scrape` endpoint
+with the following content extraction:
+
+1. **v3 pre-pass** (`extract_main_content_v3`): situation-aware extraction
+   that short-circuits on `SoftNotFound`, `JsOnly`, and anti-bot blocks.
+   Returns a coarse `page_type` classification (Article, Doc, Product,
+   Listing, Forum, Collection, Service, Unknown) and a 0.0–1.0
+   `extraction_quality` score.
+2. **v4 router** (`extract_main_content_v4`): for `Article` and `Doc`
+   page types, the optional Firecrawl html-extractor takes over with
+   trafilatura-like scoring weights and a 4-tier fallback chain. For all
+   other types, v3's noise-filtered path is kept (better at e-commerce
+   listings and forum threads).
+3. **Markdown render**: `htmd`-based conversion of the extracted subtree
+   to GitHub-Flavored Markdown.
+4. **Metadata harvest**: title, description, OG tags, language, plus
+   the first `<script type="application/ld+json">` block as structured
+   `schema_org_data` (Recipe, Product, Article, etc.).
+
+With the `crw-extract/firecrawl-extractor` Cargo feature disabled
+(the default), v4 is **bit-identical** to v3 — no behavior change, no
+build overhead. Enable it in the Dockerfile (already on by default in
+`Dockerfile.dev`) or in your custom build to use the Firecrawl pipeline
+for long-form prose and technical docs.
 
 ## Installation (binary)
 
