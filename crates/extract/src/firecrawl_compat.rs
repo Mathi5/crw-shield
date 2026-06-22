@@ -107,3 +107,118 @@ pub fn reason_from_quality(quality: f32) -> ExtractionReason {
         ExtractionReason::Fallback
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Always-available test: `reason_from_quality` is feature-agnostic.
+    // (The feature-gated tests for `map_page_type` and `extract_with_firecrawl`
+    // are in their own #[cfg] block below.)
+
+    #[test]
+    fn reason_thresholds_above_strict() {
+        assert_eq!(reason_from_quality(1.0), ExtractionReason::Strict);
+        assert_eq!(reason_from_quality(0.95), ExtractionReason::Strict);
+        assert_eq!(reason_from_quality(0.70), ExtractionReason::Strict);
+    }
+
+    #[test]
+    fn reason_thresholds_heuristic_band() {
+        assert_eq!(reason_from_quality(0.69), ExtractionReason::Heuristic);
+        assert_eq!(reason_from_quality(0.50), ExtractionReason::Heuristic);
+        assert_eq!(reason_from_quality(0.30), ExtractionReason::Heuristic);
+    }
+
+    #[test]
+    fn reason_thresholds_below_fallback() {
+        assert_eq!(reason_from_quality(0.29), ExtractionReason::Fallback);
+        assert_eq!(reason_from_quality(0.10), ExtractionReason::Fallback);
+        assert_eq!(reason_from_quality(0.00), ExtractionReason::Fallback);
+    }
+
+    #[test]
+    fn extract_with_firecrawl_stub_returns_none_without_feature() {
+        // Without the feature, the wrapper is a no-op stub.
+        #[cfg(not(feature = "firecrawl-extractor"))]
+        assert!(extract_with_firecrawl("<html><body><p>hi</p></body></html>", "https://x").is_none());
+    }
+
+    #[cfg(feature = "firecrawl-extractor")]
+    mod with_feature {
+        use super::*;
+        use crate::content::PageType;
+
+        #[test]
+        fn page_type_mapping_is_bijective() {
+            // All 8 upstream variants must map to a distinct internal variant.
+            let cases = [
+                (html_extractor::PageType::Article, PageType::Article),
+                (html_extractor::PageType::Forum, PageType::Forum),
+                (html_extractor::PageType::Product, PageType::Product),
+                (html_extractor::PageType::Listing, PageType::Listing),
+                (html_extractor::PageType::Documentation, PageType::Doc),
+                (html_extractor::PageType::Collection, PageType::Collection),
+                (html_extractor::PageType::Service, PageType::Service),
+                (html_extractor::PageType::Other, PageType::Unknown),
+            ];
+            for (firecrawl, ours) in cases {
+                assert_eq!(map_page_type(firecrawl), ours);
+            }
+        }
+
+        #[test]
+        fn extracts_basic_article() {
+            let html = r#"
+                <html>
+                  <head><title>Test</title></head>
+                  <body>
+                    <nav>Nav junk</nav>
+                    <article>
+                      <h1>Hello World</h1>
+                      <p>This is the main content. It has enough text to be useful for the extractor to identify it as a real article body.</p>
+                      <p>Multiple paragraphs help the density score. We add even more text here to push past the 25-char minimum threshold that html-extractor enforces by default.</p>
+                    </article>
+                    <footer>Footer junk</footer>
+                  </body>
+                </html>
+            "#;
+            let res = extract_with_firecrawl(html, "https://example.com/test")
+                .expect("html-extractor should be enabled and HTML is valid");
+            assert!(res.markdown.contains("Hello World"), "missing H1: {}", res.markdown);
+            assert!(
+                res.markdown.contains("main content"),
+                "missing article body: {}",
+                res.markdown
+            );
+            // Footer/nav should be stripped by the 5-stage pipeline.
+            assert!(!res.markdown.contains("Nav junk"), "nav leaked: {}", res.markdown);
+            assert!(
+                !res.markdown.contains("Footer junk"),
+                "footer leaked: {}",
+                res.markdown
+            );
+            assert!(res.quality > 0.0, "quality should be > 0, got {}", res.quality);
+        }
+
+        #[test]
+        fn empty_input_returns_none() {
+            // Upstream returns Ok(empty ExtractResult) for empty input; our
+            // wrapper treats that as a signal to fall back to v3.
+            assert!(extract_with_firecrawl("", "https://x").is_none());
+            assert!(extract_with_firecrawl("   \n  ", "https://x").is_none());
+        }
+
+        #[test]
+        fn tiny_page_still_returns_some() {
+            // Sanity check: a page with even a tiny bit of content should
+            // produce *some* output, not None. This documents the wrapper's
+            // contract that we only fall back on truly empty input.
+            let html = r#"<html><body><p>hi</p></body></html>"#;
+            let res = extract_with_firecrawl(html, "https://x");
+            assert!(
+                res.is_some(),
+                "even tiny pages should return Some so v4 router can decide"
+            );
+        }
+    }
+}
