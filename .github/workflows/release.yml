@@ -145,6 +145,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: crw-shield-linux-x86_64
+          # We use a pattern (rather than downloading all) because the
+          # docker job also uploads an internal cache artifact
+          # (Mathi5~crw-shield~*.dockerbuild). Downloading all of them
+          # races on a retry loop inside download-artifact@v4 and
+          # intermittently fails with 'Artifact download failed after 5
+          # retries' even though the artifact we care about downloaded
+          # fine. Pinning with pattern keeps the per-artifact subdirectory
+          # layout intact so the next step's path is unchanged.
 
       - name: List downloaded artifacts
         run: ls -la dist/
