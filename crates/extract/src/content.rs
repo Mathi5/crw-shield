@@ -739,9 +739,7 @@ pub fn extract_main_content_v4(
     // permissive routing. This matches the previous behavior so existing
     // tests don't regress.
     #[allow(unused_variables)]
-    let is_anti_bot = situation
-        .map(|s| s.kind.is_anti_bot())
-        .unwrap_or(false);
+    let is_anti_bot = situation.map(|s| s.kind.is_anti_bot()).unwrap_or(false);
     #[allow(unused_variables)]
     let use_firecrawl = !is_anti_bot
         && matches!(
@@ -2419,9 +2417,12 @@ mod tests {
         let r = extract_main_content_v4(&html, None, "");
         // v3 should classify this as Article — that's a precondition for
         // the Firecrawl routing to apply.
-        assert_eq!(r.result.page_type, PageType::Article,
+        assert_eq!(
+            r.result.page_type,
+            PageType::Article,
             "precondition: v3 must classify this HTML as Article (got {:?})",
-            r.result.page_type);
+            r.result.page_type
+        );
     }
 
     #[test]
@@ -2451,7 +2452,8 @@ mod tests {
             // v4 with the situation passed through.
             let v4 = extract_main_content_v4(&html, Some(&report), "");
             assert_eq!(
-                v4.result.markdown, v3_only.result.markdown,
+                v4.result.markdown,
+                v3_only.result.markdown,
                 "anti-bot situation {kind:?}: v4 markdown must equal v3 markdown \
                  (proves Firecrawl was bypassed). \
                  v3.len={} v4.len={}",
