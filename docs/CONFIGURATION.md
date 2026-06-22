@@ -48,7 +48,7 @@ All configuration is via environment variables. Defaults shown in `[]`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FLARESOLVERR_URL` | (unset) | FlareSolverr v2 endpoint, e.g. `http://192.168.1.101:8666` or `http://flaresolverr:8191` |
+| `FLARESOLVERR_URL` | (unset) | FlareSolverr v2 endpoint, e.g. `http://flaresolverr:8191` |
 | `FLARESOLVERR_HOSTS` | (unset) | Comma-separated allowlist, e.g. `nowsecure.nl,perimeterx.com,etsy.com` |
 | `FLARESOLVERR_TIMEOUT_MS` | `60000` | Client-side request timeout to FlareSolverr |
 
@@ -78,7 +78,7 @@ TLS_PROXY_ENABLED=true
 TLS_PROXY_PROFILE=chrome_120
 ROTATION_DELAY_SECS=3
 CHROME_PATH=/usr/bin/chromium
-FLARESOLVERR_URL=http://192.168.1.101:8666
+FLARESOLVERR_URL=http://flaresolverr:8191
 FLARESOLVERR_HOSTS=nowsecure.nl,perimeterx.com,kasada.io,datadome.co,leboncoin.fr,etsy.com
 FLARESOLVERR_TIMEOUT_MS=60000
 RATE_LIMIT_MIN_MS=0
