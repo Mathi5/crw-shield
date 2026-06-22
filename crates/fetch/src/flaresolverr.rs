@@ -78,6 +78,102 @@ pub struct FlareSolverrResult {
     pub user_agent: Option<String>,
 }
 
+/// Opt-in allowlist for hosts that should be escalated to FlareSolverr.
+///
+/// FlareSolverr resolves anti-bot challenges (CF IUAM, DataDome, Kasada, ...)
+/// but blindly delegating every blocked site to it causes regressions on
+/// sites that already work via L2 rotation (e.g. cloudflare.com 8385→502
+/// when FS is forced on globally, see Pitfall 17).
+///
+/// The allowlist supports two forms:
+/// - exact host entries: `nowsecure.nl`, `www.perimeterx.com`
+/// - wildcard suffixes: `*.example.com` matches any subdomain
+///
+/// Subdomain match is automatic: listing `perimeterx.com` also allows
+/// `www.perimeterx.com` and `blog.perimeterx.com`. Wildcard suffixes are
+/// only needed when the apex is itself untrusted (rare).
+#[derive(Debug, Clone, Default)]
+pub struct FlareSolverrAllowlist {
+    /// Exact host strings (also act as apex for subdomain matching).
+    hosts: std::collections::HashSet<String>,
+    /// Wildcard suffixes in the form `*.example.com`. Match if the host
+    /// ends with `.example.com`.
+    wildcards: Vec<String>,
+}
+
+impl FlareSolverrAllowlist {
+    /// Build an empty allowlist (FS escalation always skipped).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Build an allowlist from an explicit list of host strings. Empty /
+    /// blank entries are dropped. Entries beginning with `*.` are treated
+    /// as wildcard suffixes.
+    pub fn from_hosts<I, S>(hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut out = Self::default();
+        for h in hosts {
+            let trimmed = h.as_ref().trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(suffix) = trimmed.strip_prefix("*.") {
+                out.wildcards.push(format!(".{}", suffix));
+            } else {
+                out.hosts.insert(trimmed.to_ascii_lowercase());
+            }
+        }
+        out
+    }
+
+    /// Build an allowlist from the `FLARESOLVERR_HOSTS` environment variable
+    /// (comma-separated). Returns an empty allowlist when unset / blank.
+    pub fn from_env() -> Self {
+        match std::env::var("FLARESOLVERR_HOSTS") {
+            Ok(v) if !v.trim().is_empty() => {
+                Self::from_hosts(v.split(','))
+            }
+            _ => Self::empty(),
+        }
+    }
+
+    /// Returns true when the given host (case-insensitive) is allowed.
+    pub fn is_allowed(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        if self.hosts.contains(&host) {
+            return true;
+        }
+        // Subdomain match: "www.perimeterx.com" matches apex "perimeterx.com".
+        if let Some(dot_pos) = host.find('.') {
+            let apex = &host[dot_pos + 1..];
+            if self.hosts.contains(apex) {
+                return true;
+            }
+        }
+        // Wildcard match: "x.example.com" matches suffix ".example.com".
+        for suffix in &self.wildcards {
+            if host.ends_with(suffix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Number of distinct entries (hosts + wildcards).
+    pub fn len(&self) -> usize {
+        self.hosts.len() + self.wildcards.len()
+    }
+
+    /// True when the allowlist has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.wildcards.is_empty()
+    }
+}
+
 /// FlareSolverr HTTP client. Cheap to construct; share it via `Arc`.
 pub struct FlareSolverrClient {
     base_url: String,
@@ -320,5 +416,69 @@ mod tests {
         let res = client.fetch("https://example.com", 5_000).await;
         assert!(res.is_err());
         mock.assert_async().await;
+    }
+
+    // ---- FlareSolverrAllowlist tests ----
+
+    #[test]
+    fn allowlist_empty_blocks_everything() {
+        let allow = FlareSolverrAllowlist::empty();
+        assert!(allow.is_empty());
+        assert!(!allow.is_allowed("nowsecure.nl"));
+        assert!(!allow.is_allowed("cloudflare.com"));
+    }
+
+    #[test]
+    fn allowlist_exact_host_match() {
+        let allow = FlareSolverrAllowlist::from_hosts(["nowsecure.nl", "www.perimeterx.com"]);
+        assert!(allow.is_allowed("nowsecure.nl"));
+        assert!(allow.is_allowed("www.perimeterx.com"));
+        assert!(!allow.is_allowed("cloudflare.com"));
+        // Case-insensitive.
+        assert!(allow.is_allowed("NowSecure.nl"));
+    }
+
+    #[test]
+    fn allowlist_subdomain_match_via_apex() {
+        // Listing the apex allows every subdomain.
+        let allow = FlareSolverrAllowlist::from_hosts(["perimeterx.com"]);
+        assert!(allow.is_allowed("perimeterx.com"));
+        assert!(allow.is_allowed("www.perimeterx.com"));
+        assert!(allow.is_allowed("blog.cdn.perimeterx.com"));
+        assert!(!allow.is_allowed("notperimeterx.com"));
+    }
+
+    #[test]
+    fn allowlist_wildcard_suffix() {
+        let allow = FlareSolverrAllowlist::from_hosts(["*.kasada.io"]);
+        assert!(allow.is_allowed("www.kasada.io"));
+        assert!(allow.is_allowed("api.cdn.kasada.io"));
+        // The bare apex is NOT matched by `*.kasada.io` (would need an
+        // explicit `kasada.io` entry too — by design, wildcards only
+        // match subdomains).
+        assert!(!allow.is_allowed("kasada.io"));
+        assert!(!allow.is_allowed("notkasada.io"));
+    }
+
+    #[test]
+    fn allowlist_mixed_hosts_and_wildcards() {
+        let allow = FlareSolverrAllowlist::from_hosts([
+            "nowsecure.nl",
+            "datadome.co",
+            "*.etsy.com",
+        ]);
+        assert_eq!(allow.len(), 3);
+        assert!(allow.is_allowed("nowsecure.nl"));
+        assert!(allow.is_allowed("datadome.co"));
+        assert!(allow.is_allowed("www.etsy.com"));
+        assert!(allow.is_allowed("api.etsy.com"));
+        assert!(!allow.is_allowed("etsy.com")); // bare apex not in wildcard
+    }
+
+    #[test]
+    fn allowlist_from_hosts_drops_empty_entries() {
+        let allow = FlareSolverrAllowlist::from_hosts(["nowsecure.nl", "", "  "]);
+        assert_eq!(allow.len(), 1);
+        assert!(allow.is_allowed("nowsecure.nl"));
     }
 }

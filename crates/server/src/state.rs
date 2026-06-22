@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use crw_antibot::{DelayPreset, HostCounters};
 use crw_core::Config;
-use crw_fetch::{CdpConfig, CdpFetcher, FetchLadder, FlareSolverrClient, HttpFetcher, TlsProxy};
+use crw_fetch::{
+    CdpConfig, CdpFetcher, FetchLadder, FlareSolverrAllowlist, FlareSolverrClient,
+    HttpFetcher, TlsProxy,
+};
 
 use crate::handlers::CrawlJob;
 
@@ -95,9 +98,21 @@ impl AppState {
             },
             _ => None,
         };
+        // Light.4: opt-in allowlist (env: FLARESOLVERR_HOSTS). Empty when
+        // unset, which preserves the "FS disabled by default" behaviour
+        // called out in Pitfall 17 (global FS regresses cloudflare.com
+        // 8385→502).
+        let fs_allowlist = FlareSolverrAllowlist::from_env();
+        if !fs_allowlist.is_empty() && flaresolverr.is_some() {
+            tracing::info!(
+                hosts = fs_allowlist.len(),
+                "FlareSolverr opt-in allowlist active"
+            );
+        }
         let ladder = Arc::new(
             FetchLadder::new(http, cdp, flaresolverr)
-                .with_tls_proxy_opt(tls_proxy.clone()),
+                .with_tls_proxy_opt(tls_proxy.clone())
+                .with_flaresolverr_allowlist(fs_allowlist),
         );
         Self {
             config: Arc::new(config),
@@ -144,8 +159,11 @@ impl AppState {
             },
             _ => None,
         };
+        let fs_allowlist = FlareSolverrAllowlist::from_env();
         let ladder = Arc::new(
-            FetchLadder::new(http, cdp, flaresolverr).with_tls_proxy_opt(None),
+            FetchLadder::new(http, cdp, flaresolverr)
+                .with_tls_proxy_opt(None)
+                .with_flaresolverr_allowlist(fs_allowlist),
         );
         Self {
             config: Arc::new(config),

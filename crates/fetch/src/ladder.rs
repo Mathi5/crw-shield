@@ -15,14 +15,14 @@ use async_trait::async_trait;
 use base64::Engine;
 use crw_antibot::{
     counter_for_host as counter_for, detect_challenge, detect_empty_or_blocked, decide_rotation,
-    diagnose_situation, CookieJar, HostCounters, L2_COOLDOWN, RotationDecision, SituationReport,
-    SuggestedLadder,
+    diagnose_situation, CookieJar, HostCounters, L2_COOLDOWN, RotationDecision, SituationKind,
+    SituationReport, SuggestedLadder,
 };
 use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, ScrapeResponse};
 use tracing::{debug, info, warn};
 
 use crate::cdp::{CdpFetchResult, CdpFetcher};
-use crate::flaresolverr::FlareSolverrClient;
+use crate::flaresolverr::{FlareSolverrAllowlist, FlareSolverrClient};
 use crate::http::{FetchResult, Fetcher, HttpFetcher};
 use crate::tls_proxy::TlsProxy;
 
@@ -66,6 +66,9 @@ pub struct FetchLadder {
     http: Arc<HttpFetcher>,
     cdp: Option<Arc<CdpFetcher>>,
     flaresolverr: Option<Arc<FlareSolverrClient>>,
+    /// Allowlist of hosts that may be escalated to FlareSolverr. When the
+    /// list is empty (default), FS is never invoked — see Pitfall 17.
+    fs_allowlist: FlareSolverrAllowlist,
     cookies: Arc<CookieJar>,
     /// Optional handle to the `tls-impersonate-proxy` sidecar. When set,
     /// the L2 rotation path will SIGKILL the proxy and respawn it with
@@ -87,9 +90,23 @@ impl FetchLadder {
             http,
             cdp,
             flaresolverr,
+            // Empty by default — `with_flaresolverr_allowlist` opts in.
+            fs_allowlist: FlareSolverrAllowlist::empty(),
             cookies,
             tls_proxy: None,
         }
+    }
+
+    /// Replace the FlareSolverr allowlist. Pass an empty list to disable
+    /// FS escalation entirely (the default).
+    pub fn with_flaresolverr_allowlist(mut self, allowlist: FlareSolverrAllowlist) -> Self {
+        self.fs_allowlist = allowlist;
+        self
+    }
+
+    /// Borrow the FlareSolverr allowlist.
+    pub fn fs_allowlist(&self) -> &FlareSolverrAllowlist {
+        &self.fs_allowlist
     }
 
     /// Attach a `tls-impersonate-proxy` handle. Returns `Self` for chaining.
@@ -140,6 +157,9 @@ impl FetchLadder {
             http,
             cdp,
             flaresolverr,
+            // Tests / sync construction default to no FS escalation —
+            // call `with_flaresolverr_allowlist` to opt in.
+            fs_allowlist: FlareSolverrAllowlist::empty(),
             cookies,
             tls_proxy: None,
         })
@@ -233,7 +253,32 @@ impl FetchLadder {
     /// kind so operators can tell whether the page was empty / JS-only
     /// or a specific DataDome / Cloudflare / Akamai challenge. Tests
     /// pin this contract.
-    fn validate_flaresolverr_solution(html: &str) -> std::result::Result<(), String> {
+    fn validate_flaresolverr_solution(
+        html: &str,
+    ) -> std::result::Result<Option<SituationKind>, String> {
+        // 0. (Light.4) — large resolved pages with a <title> tag are
+        //    legitimate even if their markup still contains CF / DataDome
+        //    fingerprints (challenge-platform scripts, inline anti-bot
+        //    tokens). FlareSolverr's response is the *real* page once the
+        //    challenge is solved — the fingerprints are inert JS.
+        //    Rejecting those was a false positive that left every FS
+        //    fetch stuck in HITL_REQUIRED (nowsecure.nl 179k chars was
+        //    being thrown away, datadome.co 1.4k chars too).
+        //    IMPORTANT: this check must run *before* the generic
+        //    detect_empty_or_blocked below — that helper classifies
+        //    pages with residual CF fingerprints as anti-bot (via
+        //    `is_anti_bot()`), so the resolved-page escape hatch needs
+        //    to fire first.
+        //
+        //    Returning `Ok(Some(CleanSuccess))` tells the caller to
+        //    override the auto-diagnosed situation (which would still
+        //    say `CloudflareIuam` based on the residual fingerprint),
+        //    otherwise the upstream `is_anti_bot()` gate in
+        //    handlers.rs would still flip the response to HITL_REQUIRED.
+        const RESOLVED_PAGE_THRESHOLD: usize = 5_000;
+        if html.len() > RESOLVED_PAGE_THRESHOLD && html.contains("<title") {
+            return Ok(Some(crw_antibot::SituationKind::CleanSuccess));
+        }
         // 1. Classify the HTML into a situation kind so we can name the
         //    exact provider in the error message.
         let situation = crw_antibot::diagnose_situation(html, None, None);
@@ -257,7 +302,8 @@ impl FetchLadder {
                 "flaresolverr returned anti-bot page ({provider})"
             ));
         }
-        Ok(())
+        // No overrides — keep the auto-diagnosed situation.
+        Ok(None)
     }
 
     /// Phase C.3 — adaptive retry decision.
@@ -341,6 +387,28 @@ impl FetchLadder {
         request: &ScrapeRequest,
         from_cdp: bool,
     ) -> Result<Option<LadderResult>> {
+        // Light.4: FlareSolverr opt-in per host. When the host is not in the
+        // allowlist (or the allowlist is empty) we silently skip FS and let
+        // the caller fall back to HITL_REQUIRED. This avoids the global-FS
+        // regression where sites like cloudflare.com 8385→502 (Pitfall 17).
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        if let Some(h) = &host {
+            if !self.fs_allowlist.is_allowed(h) {
+                debug!(
+                    url = %url,
+                    host = %h,
+                    "FlareSolverr escalation skipped: host not in opt-in allowlist"
+                );
+                return Ok(None);
+            }
+        } else {
+            // No parseable host — don't blindly FS.
+            debug!(url = %url, "FlareSolverr escalation skipped: unparseable URL");
+            return Ok(None);
+        }
+
         let Some(fs) = self.flaresolverr.as_ref() else {
             warn!(
                 url = %url,
@@ -368,19 +436,32 @@ impl FetchLadder {
                 // ---- LIGHT.2: anti-bot validation ----
                 // Build a real situation report from the FlareSolverr HTML so
                 // the caller knows what it actually got.
-                let situation = Self::diagnose_fetch(&fetch);
+                let mut situation = Self::diagnose_fetch(&fetch);
 
                 // Hard-fail: the response still looks like an anti-bot page.
                 // Return `Err` so the ladder can decide what to do (the
                 // typical path is to bubble the error to the operator since
                 // we've exhausted our escalation budget).
-                if let Err(msg) = Self::validate_flaresolverr_solution(&solution.html) {
-                    warn!(
-                        url = %url,
-                        kind = %situation.kind,
-                        "FlareSolverr returned anti-bot page; failing"
-                    );
-                    return Err(crw_core::CrwError::Fetch(msg));
+                match Self::validate_flaresolverr_solution(&solution.html) {
+                    Err(msg) => {
+                        warn!(
+                            url = %url,
+                            kind = %situation.kind,
+                            "FlareSolverr returned anti-bot page; failing"
+                        );
+                        return Err(crw_core::CrwError::Fetch(msg));
+                    }
+                    Ok(Some(override_kind)) => {
+                        // The validator accepted the HTML but wants to
+                        // override the auto-diagnosed situation (Light.4
+                        // bypass for large resolved pages). Otherwise the
+                        // upstream `is_anti_bot()` gate in handlers.rs
+                        // would still flip the response to HITL_REQUIRED.
+                        situation.kind = override_kind;
+                    }
+                    Ok(None) => {
+                        // No override; keep the auto-diagnosed situation.
+                    }
                 }
 
                 Ok(Some(LadderResult {
@@ -1255,5 +1336,49 @@ Definitely not a bot block page.</p>
             msg.contains("cloudflare") || msg.contains("turnstile"),
             "expected cloudflare-classifier message, got: {msg}"
         );
+    }
+
+    // ---- Light.4: large resolved pages bypass the CF/DataDome fingerprint
+    //      detector. FlareSolverr's response is the *real* page once the
+    //      challenge is solved — the remaining fingerprint scripts are
+    //      inert. ----
+
+    #[test]
+    fn validate_flaresolverr_solution_accepts_large_resolved_cloudflare_page() {
+        // A page with >5000 chars, a <title>, and CF challenge-platform
+        // scripts (still served by FlareSolverr after solving the JS
+        // challenge). Should be accepted as resolved content.
+        let mut html = String::from(
+            r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Real Page After CF Challenge Solved</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+</head>
+<body>
+<h1>Welcome to the site</h1>
+<p>"#,
+        );
+        // Pad to >5000 chars so the resolved-page threshold triggers.
+        html.push_str(&"Lorem ipsum dolor sit amet. ".repeat(200));
+        html.push_str("</p></body></html>");
+
+        let res = FetchLadder::validate_flaresolverr_solution(&html);
+        assert!(res.is_ok(), "expected Ok for resolved CF page, got: {res:?}");
+    }
+
+    #[test]
+    fn validate_flaresolverr_solution_still_rejects_short_cf_page() {
+        // Below the 5000-char threshold — even if a <title> is present, a
+        // short page with CF fingerprint scripts is likely still a
+        // challenge page, not a real one.
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Just a moment...</title></head>
+<body>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>
+<noscript>cf-mitigated.</noscript>
+</body></html>"#;
+        let res = FetchLadder::validate_flaresolverr_solution(html);
+        assert!(res.is_err(), "expected Err for short CF challenge, got Ok");
     }
 }

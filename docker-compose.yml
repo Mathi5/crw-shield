@@ -10,7 +10,17 @@ services:
       - HOST=0.0.0.0
       - PORT=3002
       # SEARXNG_URL=http://host.docker.internal:8080
-      - FLARESOLVERR_URL=
+      # FlareSolverr is opt-in per host (see FLARESOLVERR_HOSTS below).
+      # FS resolves CF IUAM / DataDome / Kasada / PerimeterX challenges
+      # from our IP résidentielle Freebox. Disabled by default to preserve
+      # the L2-only path (Pitfall 17: forcing FS globally regresses
+      # cloudflare.com 8385→502).
+      - FLARESOLVERR_URL=http://192.168.1.101:8666
+      # Comma-separated list of hosts to escalate to FlareSolverr.
+      # Supports `*.example.com` wildcards. Apex entries (no `*.`) also
+      # match subdomains. Leave blank to disable FS entirely even when
+      # FLARESOLVERR_URL is set.
+      - FLARESOLVERR_HOSTS=nowsecure.nl,perimeterx.com,kasada.io,datadome.co,leboncoin.fr,etsy.com,stackoverflow.com
       # SEARXNG_TOKEN=***
       # AUTH_TOKEN=***
       # STEALTH_ENABLED=true
