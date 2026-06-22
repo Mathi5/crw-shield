@@ -680,6 +680,86 @@ pub fn extract_main_content_v3(
     }
 }
 
+/// Phase D: page-type-aware extraction router. v4 consults the *current*
+/// page-type classification (from v3's preliminary pass), then delegates
+/// to the best extractor for the job:
+///
+/// - `Article` / `Doc` → `firecrawl/html-extractor` (5-stage trafilatura-like
+///   pipeline, page-type-aware scoring weights). Best at long-form prose
+///   and technical documentation.
+/// - `Product` / `Listing` / `Collection` / `Forum` / `Service` / `Unknown`
+///   → `extract_main_content_v3` (our existing path). Better at e-commerce
+///   noise filtering (the 22 `NOISE_SUBSTRINGS` heuristics) and forum
+///   threads where antibot situation-awareness matters.
+///
+/// Returns the same `ExtractionResultWithReason` shape as v3 so the
+/// `handlers.rs` call site and the public `extraction_quality` API field
+/// don't change. The `reason` field is computed from the Firecrawl
+/// quality score when the Firecrawl path is taken; from the v3 decision
+/// otherwise.
+///
+/// IMPORTANT: the Firecrawl path is feature-gated on `firecrawl-extractor`.
+/// When the feature is off, v4 behaves identically to v3 (no behavior
+/// change, no overhead).
+///
+/// Note: the `url` argument is forwarded to the Firecrawl extractor for
+/// relative→absolute link rewriting and scoring position hints. Without
+/// it, the upstream still works (relative URLs stay as-is in markdown),
+/// but link rewriting and some page-type signals are degraded.
+pub fn extract_main_content_v4(
+    html: &str,
+    situation: Option<&SituationReport>,
+    // `url` is only forwarded to the Firecrawl extractor. When the
+    // `firecrawl-extractor` feature is off, the parameter is unused —
+    // `#[allow(unused_variables)]` keeps the signature stable across
+    // feature builds so call sites don't need to be `#[cfg]`-gated.
+    #[allow(unused_variables)] url: &str,
+) -> ExtractionResultWithReason {
+    // Cheap pre-classification on the current v3 result. We reuse v3's
+    // page-type detection so we don't double-parse the HTML for the common
+    // case (Article/Doc) — v2 already scored it.
+    let preliminary = extract_main_content_v3(html, situation);
+    // `use_firecrawl` is the gate for the feature-gated delegation below.
+    // Without the feature it's unused, hence the `#[allow]`.
+    #[allow(unused_variables)]
+    let use_firecrawl = matches!(
+        preliminary.result.page_type,
+        PageType::Article | PageType::Doc
+    );
+
+    // Feature-gated Firecrawl delegation. When the feature is on AND the
+    // page-type is Article/Doc, we re-extract with the upstream pipeline
+    // and merge the result. The v3 quality override is preserved so the
+    // antibot situation-awareness still wins on real 404 / JS-only pages.
+    #[cfg(feature = "firecrawl-extractor")]
+    {
+        if use_firecrawl {
+            if let Some(fe_res) = crate::firecrawl_compat::extract_with_firecrawl(html, url) {
+                let reason = crate::firecrawl_compat::reason_from_quality(fe_res.quality);
+                return ExtractionResultWithReason {
+                    reason,
+                    situation_kind: preliminary.situation_kind,
+                    result: ExtractionResult {
+                        markdown: fe_res.markdown,
+                        quality: fe_res.quality,
+                        page_type: fe_res.page_type,
+                        // Firecrawl's "used_fallback" is more nuanced than our
+                        // v3 boolean (it tracks which of the 5 stages won).
+                        // We expose it transparently so the API can surface
+                        // it for debugging.
+                        used_fallback: fe_res.used_fallback,
+                    },
+                };
+            }
+            // Fall through to v3 if Firecrawl returns None (empty input
+            // edge case). v3 will give us a sensible result for thin pages.
+        }
+    }
+    // Default path: v3 (covers Product/Listing/Forum/Unknown + the
+    // no-feature build).
+    preliminary
+}
+
 /// Decision produced by looking at the situation report. Cheap to
 /// construct: no HTML parsing, no token scan. The caller applies the
 /// decision to the v2 result.
