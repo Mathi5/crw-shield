@@ -5,7 +5,7 @@ All notable changes to crw-shield are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-06-22
 
 ### Added
 - Optional `firecrawl-extractor` feature in `crw-extract` that uses
@@ -29,14 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up wiring (already implemented + tested; live retry loop
   deferred to a separate change).
 
-### Notes
-- Default build is **unchanged**: no new deps compiled unless
-  `--features crw-extract/firecrawl-extractor` is passed. Build time
-  delta with the feature on: ~30s cold, ~3s warm.
-- Bench (inline fixtures, release build): v4 adds ~0.15ms over v3
-  per `Article` / `Doc` page (v3 pre-pass + Firecrawl re-parse).
-  `Product` / `Forum` are bit-identical to v3, confirming the router.
-
 ### Fixed
 - **Phase D.1 (situation-aware routing)**: `extract_main_content_v4`
   now consults the upstream `SituationReport` before delegating to
@@ -54,13 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Anti-bot correctly bypassed**: perimeterx-demo no longer returns
   153 bytes of challenge-page garbage extracted by Firecrawl — it
   now escalates to `HITL_REQUIRED` like every other anti-bot site.
-- **Aggregate** (23 sites OK in both v0.1.0 baseline and v4d):
+- **Aggregate** (23 sites OK in both v0.1.0 baseline and v0.2.0):
   +32.5% bytes, **+33% mean quality score** (0.198 → 0.263).
 - Caveats: bench binaire ran on host with `CHROME_PATH=/snap/bin/chromium`
   and local FS/CDP ladder (no FlareSolverr/TLS proxy like the docker
   build), so a few Tier 3 sites appear as `HITL_REQUIRED` on the host
   where the docker v0.1.0 baseline succeeded. This is an environment
   difference, not a Phase D.1 regression.
+
+## [Unreleased]
 
 ## [0.1.0] - 2026-06-22
 
