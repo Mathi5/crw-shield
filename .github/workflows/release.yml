@@ -159,7 +159,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/Mathi5/crw-shield:${{ steps.version.outputs.VERSION }}
-            ghcr.io/Mathi5/crw-shield:latest
+            ghcr.io/mathi5/crw-shield:${{ steps.version.outputs.VERSION }}
+            ghcr.io/mathi5/crw-shield:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
