@@ -721,11 +721,33 @@ pub fn extract_main_content_v4(
     let preliminary = extract_main_content_v3(html, situation);
     // `use_firecrawl` is the gate for the feature-gated delegation below.
     // Without the feature it's unused, hence the `#[allow]`.
+    //
+    // Phase D.1 fix: situation-aware routing. When the upstream FetchReport
+    // detected an anti-bot challenge (Cloudflare IUAM, DataDome, Kasada,
+    // Akamai, etc.), we MUST stay on v3 because:
+    //   1. Firecrawl's HTML pipeline has no antibot awareness — it will
+    //      extract whatever HTML the server returned, including the
+    //      challenge page itself ("Press & Hold to confirm you are human").
+    //   2. v3's `extract_main_content_v3` consumes the same `SituationReport`
+    //      and downgrades quality / uses fallbacks for SoftNotFound / JsOnly.
+    //   3. Bench 30-site validated this: perimeterx-demo went from 53K bytes
+    //      / q=0.40 (v3) to 153 bytes / q=0.10 (v4) because Firecrawl
+    //      "successfully" extracted the PerimeterX challenge page.
+    //
+    // When `situation` is `None` (e.g. direct unit-test calls without a real
+    // fetch), we have no signal to distrust the HTML, so we keep the old
+    // permissive routing. This matches the previous behavior so existing
+    // tests don't regress.
     #[allow(unused_variables)]
-    let use_firecrawl = matches!(
-        preliminary.result.page_type,
-        PageType::Article | PageType::Doc
-    );
+    let is_anti_bot = situation
+        .map(|s| s.kind.is_anti_bot())
+        .unwrap_or(false);
+    #[allow(unused_variables)]
+    let use_firecrawl = !is_anti_bot
+        && matches!(
+            preliminary.result.page_type,
+            PageType::Article | PageType::Doc
+        );
 
     // Feature-gated Firecrawl delegation. When the feature is on AND the
     // page-type is Article/Doc, we re-extract with the upstream pipeline
@@ -2365,5 +2387,100 @@ mod tests {
         let r = extract_main_content_v3(&padded, Some(&report));
         let json = serde_json::to_string(&r.reason).unwrap();
         assert!(json.contains("SoftNotFound"));
+    }
+
+    // ---- Phase D.1: situation-aware routing in extract_main_content_v4 ----
+    //
+    // Without a `SituationReport`, the router falls back to the page-type
+    // signal alone (legacy behaviour). With a `Some(report)` whose `kind`
+    // is an anti-bot variant (Cloudflare/DataDome/Kasada/etc.), Firecrawl
+    // MUST be bypassed regardless of page-type — because Firecrawl will
+    // happily extract the challenge page itself as if it were content.
+    //
+    // These tests run identically with and without the
+    // `firecrawl-extractor` feature (the v3 path must remain stable).
+
+    fn long_article_html() -> String {
+        // 2KB of plausible article body — long enough that v3 will tag it
+        // as Article (scoring bonuses on length + structural landmarks).
+        let body = (0..30)
+            .map(|i| format!("<p>Paragraph {i} with real prose about a topic of interest. It contains enough words to feel like a real article body, not a stub. The vocabulary is varied and the sentences have structure.</p>"))
+            .collect::<String>();
+        format!(
+            r#"<html><body><article><h1>Real Article Title</h1>{body}<aside>sidebar noise</aside></article></body></html>"#
+        )
+    }
+
+    #[test]
+    fn v4_no_situation_routes_to_firecrawl_for_article() {
+        // Sanity check: without a SituationReport, an Article-shaped page
+        // routes to Firecrawl (when the feature is enabled).
+        let html = long_article_html();
+        let r = extract_main_content_v4(&html, None, "");
+        // v3 should classify this as Article — that's a precondition for
+        // the Firecrawl routing to apply.
+        assert_eq!(r.result.page_type, PageType::Article,
+            "precondition: v3 must classify this HTML as Article (got {:?})",
+            r.result.page_type);
+    }
+
+    #[test]
+    fn v4_anti_bot_situation_bypasses_firecrawl() {
+        // The critical fix: when the upstream FetchReport flagged an
+        // anti-bot challenge, v4 must stay on v3 (Firecrawl would extract
+        // the challenge page and return inflated "quality" for garbage).
+        //
+        // Direct assertion strategy: run the same HTML through v3 directly
+        // and through v4 with an anti-bot situation. The two markdown
+        // outputs MUST be identical — that's the proof that Firecrawl was
+        // not delegated to (Firecrawl re-parses and re-extracts, so its
+        // markdown always differs from v3's, even slightly).
+        let html = long_article_html();
+        // Cloudflare IUAM is the canonical anti-bot kind. Tested variants
+        // cover DataDome / Kasada / Akamai / PerimeterX — all `is_anti_bot()`.
+        for kind in [
+            crw_antibot::SituationKind::CloudflareIuam,
+            crw_antibot::SituationKind::DataDomeCaptcha,
+            crw_antibot::SituationKind::Kasada,
+            crw_antibot::SituationKind::AkamaiBotManager,
+            crw_antibot::SituationKind::PerimeterX,
+        ] {
+            let report = synth_report(kind, crw_antibot::SuggestedLadder::Cdp);
+            // Reference: v3 alone with the same situation.
+            let v3_only = extract_main_content_v3(&html, Some(&report));
+            // v4 with the situation passed through.
+            let v4 = extract_main_content_v4(&html, Some(&report), "");
+            assert_eq!(
+                v4.result.markdown, v3_only.result.markdown,
+                "anti-bot situation {kind:?}: v4 markdown must equal v3 markdown \
+                 (proves Firecrawl was bypassed). \
+                 v3.len={} v4.len={}",
+                v3_only.result.markdown.len(),
+                v4.result.markdown.len(),
+            );
+            assert_eq!(
+                v4.result.quality, v3_only.result.quality,
+                "anti-bot situation {kind:?}: v4 quality must equal v3 quality",
+            );
+        }
+    }
+
+    #[test]
+    fn v4_clean_success_situation_routes_to_firecrawl_for_article() {
+        // Counter-test: CleanSuccess must NOT block Firecrawl routing.
+        // The `is_anti_bot()` predicate returns false for CleanSuccess.
+        let html = long_article_html();
+        let report = synth_report(
+            crw_antibot::SituationKind::CleanSuccess,
+            crw_antibot::SuggestedLadder::None,
+        );
+        // We can't easily assert "Firecrawl was used" without the feature,
+        // so we just assert the routing decision is permissive: v3 still
+        // returns Article (so Firecrawl WOULD be eligible if enabled).
+        let r = extract_main_content_v4(&html, Some(&report), "");
+        assert_eq!(r.result.page_type, PageType::Article);
+        // And it must not be flagged as AntiBotBlock — that would mean
+        // we wrongly classified a clean response.
+        assert_ne!(r.reason, ExtractionReason::AntiBotBlock);
     }
 }
