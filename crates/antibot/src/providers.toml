@@ -104,6 +104,24 @@ headers = ["x-iinfo", "x-cdn", "incap-ses"]
 suggested_ladder = "cdp"
 notes = "WAF. CDP can solve; FlareSolverr works on most sites."
 
+# --- Fastly Compute@Edge Bot Management ---
+[providers.fastly_edge_challenge]
+kind = "challenge"
+tokens = [
+    "client challenge",
+    "/_fs-ch-",
+    "loading-error",
+    "a required part of this site couldn",
+    "please check your connection, disable any ad blockers",
+    "javascript is disabled in your browser",
+    "fastly edge",
+    "fastly compute",
+]
+status_codes = [200]
+headers = ["x-fastly-request-id", "x-served-by"]
+suggested_ladder = "cdp"
+notes = "Fastly Compute@Edge bot management (e.g. LeMonde.fr). The 'Client Challenge' page is served with HTTP 200; CDP with stealth usually solves after first challenge JS runs."
+
 # --- PerimeterX (now HUMAN) ---
 [providers.perimeterx]
 kind = "captcha"

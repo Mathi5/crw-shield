@@ -35,6 +35,8 @@ pub enum SituationKind {
     AkamaiBotManager,
     /// Imperva / Incapsula WAF.
     ImpervaIncapsula,
+    /// Fastly Compute@Edge Bot Management (e.g. LeMonde.fr).
+    FastlyEdgeChallenge,
     /// PerimeterX (now HUMAN) captcha.
     PerimeterX,
     /// reCAPTCHA v2/v3.
@@ -92,6 +94,7 @@ impl SituationKind {
             SituationKind::DataDomeCaptcha => "datadome_captcha",
             SituationKind::AkamaiBotManager => "akamai_bot_manager",
             SituationKind::ImpervaIncapsula => "imperva_incapsula",
+            SituationKind::FastlyEdgeChallenge => "fastly_edge_challenge",
             SituationKind::PerimeterX => "perimeterx",
             SituationKind::Recaptcha => "recaptcha",
             SituationKind::Hcaptcha => "hcaptcha",
@@ -127,6 +130,7 @@ impl SituationKind {
                 | SituationKind::DataDomeCaptcha
                 | SituationKind::AkamaiBotManager
                 | SituationKind::ImpervaIncapsula
+                | SituationKind::FastlyEdgeChallenge
                 | SituationKind::PerimeterX
                 | SituationKind::Recaptcha
                 | SituationKind::Hcaptcha
@@ -158,6 +162,7 @@ impl SituationKind {
             SituationKind::DataDomeCaptcha => SuggestedLadder::FlareSolverr,
             SituationKind::AkamaiBotManager => SuggestedLadder::Cdp,
             SituationKind::ImpervaIncapsula => SuggestedLadder::Cdp,
+            SituationKind::FastlyEdgeChallenge => SuggestedLadder::Cdp,
             SituationKind::PerimeterX => SuggestedLadder::FlareSolverr,
             SituationKind::Recaptcha => SuggestedLadder::Cdp,
             SituationKind::Hcaptcha => SuggestedLadder::Cdp,
@@ -674,6 +679,7 @@ pub(crate) mod providers {
             "datadome_captcha" => SituationKind::DataDomeCaptcha,
             "akamai_bot_manager" => SituationKind::AkamaiBotManager,
             "imperva_incapsula" => SituationKind::ImpervaIncapsula,
+            "fastly_edge_challenge" => SituationKind::FastlyEdgeChallenge,
             "perimeterx" => SituationKind::PerimeterX,
             "recaptcha" => SituationKind::Recaptcha,
             "hcaptcha" => SituationKind::Hcaptcha,
@@ -966,5 +972,48 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         // Default serde derive serializes unit variants as bare strings.
         assert!(json.contains("\"Token\""), "got: {json}");
+    }
+
+    #[test]
+    fn fastly_edge_challenge_diagnoses_from_title() {
+        let html = r##"<!DOCTYPE html>
+<html lang="en"><head>
+<title>Client Challenge</title>
+</head><body>
+<div id="loading-error">A required part of this site couldn't load.</div>
+</body></html>"##;
+        let report = diagnose(html, Some(200), None);
+        assert_eq!(report.kind, SituationKind::FastlyEdgeChallenge);
+        assert_eq!(report.suggested_ladder, SuggestedLadder::Cdp);
+        assert!(!report.evidence.is_empty());
+    }
+
+    #[test]
+    fn fastly_edge_challenge_diagnoses_from_path_token() {
+        let html = r##"<!DOCTYPE html>
+<html><head>
+<link href="/_fs-ch-1T1wmsGaOgGaSxcX/assets/styles.css" rel="stylesheet">
+</head><body>
+<div id="loading-error">Loading...</div>
+</body></html>"##;
+        let report = diagnose(html, Some(200), None);
+        assert_eq!(report.kind, SituationKind::FastlyEdgeChallenge);
+    }
+
+    #[test]
+    fn fastly_edge_challenge_does_not_trigger_on_clean_article() {
+        // Wikipedia-class clean article must NOT trigger Fastly detection.
+        let html = r##"<!DOCTYPE html>
+<html><head><title>Fastly - Wikipedia</title></head>
+<body><main><h1>Fastly</h1>
+<p>Fastly, Inc. is an American cloud computing services provider.
+The company offers a content delivery network (CDN) and edge cloud services.
+Founded in 2011 by Artur Bergman, the company is headquartered in San Francisco.
+Their edge cloud platform includes Compute@Edge, image optimization, and security.
+The company competes with Cloudflare, Akamai Technologies, and AWS CloudFront.
+This is real content that should not be flagged as a bot challenge.</p></main></body></html>"##;
+        let report = diagnose(html, Some(200), None);
+        // The token "fastly" alone is not strong enough; the article should remain CleanSuccess.
+        assert_eq!(report.kind, SituationKind::CleanSuccess);
     }
 }
