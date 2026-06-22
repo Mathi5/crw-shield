@@ -93,7 +93,14 @@ jobs:
       - name: Package archive
         shell: bash
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          # Same resolution as the release job: prefer inputs.tag on
+          # workflow_dispatch (so 'main' doesn't leak into the tarball
+          # filename), otherwise strip the leading 'v' from github.ref_name.
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
           DIR="crw-shield-$VERSION-linux-x86_64"
           mkdir -p "$DIR"
           cp target/release/crw-server "$DIR/crw-shield"
@@ -117,6 +124,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # workflow_dispatch passes a tag name via inputs.tag; we still
+          # need the tag's commit to be checked out, so ref is set to it.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version
+        id: version
+        # github.ref_name is the tag name on a tag push ('v0.2.0'), but
+        # on a workflow_dispatch it falls back to the default branch
+        # ('main'). For dispatch we use the tag the caller passed.
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "VERSION=${{ inputs.tag }}" | sed 's/^v//' >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -130,8 +153,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
           generate_release_notes: true
+          # The artifact filename is fixed by the build job, so we hard-code
+          # it here regardless of which tag triggered the workflow.
           files: dist/crw-shield-linux-x86_64/crw-shield-linux-x86_64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -145,6 +170,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -158,7 +185,15 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        # Same resolution as the release job: prefer inputs.tag on
+        # workflow_dispatch (so 'main' doesn't leak into image tags),
+        # otherwise strip the leading 'v' from github.ref_name.
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "VERSION=${{ inputs.tag }}" | sed 's/^v//' >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build and push
         uses: docker/build-push-action@v6
