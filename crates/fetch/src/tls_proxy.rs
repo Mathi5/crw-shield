@@ -39,6 +39,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -477,11 +479,18 @@ impl TlsProxy {
 mod tests {
     use super::*;
 
+    // Env-var tests must not run concurrently because they mutate process-wide
+    // environment variables. Same pattern as `crw_core::config::tests::ENV_LOCK`.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn config_disabled_by_default() {
-        // SAFETY: only the parent process reads this in tests, and tests
-        // run sequentially within a single test binary. Remove every
-        // TLS_PROXY_* var so a previous test can't leak.
+        let _guard = lock_env();
+        // Remove every TLS_PROXY_* var so a previous test can't leak.
         unsafe {
             std::env::remove_var("TLS_PROXY_ENABLED");
             std::env::remove_var("TLS_PROXY_PROFILE");
@@ -493,6 +502,7 @@ mod tests {
 
     #[test]
     fn config_enabled_via_env() {
+        let _guard = lock_env();
         unsafe { std::env::set_var("TLS_PROXY_ENABLED", "true") };
         let cfg = TlsProxyConfig::from_env().expect("should be enabled");
         assert_eq!(cfg.listen, DEFAULT_LISTEN);
@@ -504,6 +514,7 @@ mod tests {
 
     #[test]
     fn config_enabled_via_one() {
+        let _guard = lock_env();
         unsafe { std::env::set_var("TLS_PROXY_ENABLED", "1") };
         assert!(TlsProxyConfig::from_env().is_some());
         unsafe { std::env::remove_var("TLS_PROXY_ENABLED") };
@@ -511,6 +522,7 @@ mod tests {
 
     #[test]
     fn config_enabled_via_yes() {
+        let _guard = lock_env();
         unsafe { std::env::set_var("TLS_PROXY_ENABLED", "yes") };
         assert!(TlsProxyConfig::from_env().is_some());
         unsafe { std::env::remove_var("TLS_PROXY_ENABLED") };
@@ -559,6 +571,7 @@ mod tests {
 
     #[test]
     fn custom_ladder_via_env() {
+        let _guard = lock_env();
         unsafe {
             std::env::remove_var("TLS_PROXY_PROFILE");
             std::env::set_var("TLS_PROXY_ENABLED", "true");
@@ -583,6 +596,7 @@ mod tests {
 
     #[test]
     fn custom_ladder_prepends_initial_profile() {
+        let _guard = lock_env();
         unsafe {
             std::env::set_var("TLS_PROXY_ENABLED", "true");
             std::env::set_var("TLS_PROXY_PROFILE", "firefox_123");
@@ -607,6 +621,7 @@ mod tests {
 
     #[test]
     fn empty_ladder_disables_rotation() {
+        let _guard = lock_env();
         unsafe {
             std::env::set_var("TLS_PROXY_ENABLED", "true");
             std::env::set_var("TLS_PROXY_PROFILES", "");
@@ -622,6 +637,7 @@ mod tests {
 
     #[test]
     fn rotation_delay_default_15s() {
+        let _guard = lock_env();
         unsafe {
             std::env::set_var("TLS_PROXY_ENABLED", "true");
             std::env::remove_var("TLS_PROXY_ROTATION_DELAY_SECS");
@@ -636,6 +652,7 @@ mod tests {
 
     #[test]
     fn rotation_delay_override() {
+        let _guard = lock_env();
         unsafe {
             std::env::set_var("TLS_PROXY_ENABLED", "true");
             std::env::set_var("TLS_PROXY_ROTATION_DELAY_SECS", "0");
