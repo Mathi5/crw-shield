@@ -335,6 +335,18 @@ impl FetchLadder {
     /// The decision is intentionally conservative: we never retry
     /// `SoftNotFound`, `ServerError`, `RateLimited`, `GeoBlocked` —
     /// re-hitting those with the same ladder step would just waste time.
+    ///
+    /// **Status (Phase D)**: this function is fully implemented and unit-tested
+    /// (see `ladder.rs:1177-1270`), but it is NOT yet wired into the live
+    /// request flow. The handler runs the ladder once, then extracts; a
+    /// retry loop would require either a second `ladder.fetch` call or a
+    /// refactor of `scrape_via_ladder` to accept a closure-based extraction
+    /// callback. Both are out of scope for the Phase D plan. When the
+    /// Firecrawl html-extractor is enabled and produces a low
+    /// `extraction_quality` score, operators can wire this in as a
+    /// follow-up by calling it from `handlers.rs` after the v4 extraction
+    /// step and triggering a `ladder.fetch` retry.
+    #[allow(dead_code)]
     pub fn should_retry_for_quality(
         quality: f32,
         situation: &SituationReport,
