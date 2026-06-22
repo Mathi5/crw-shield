@@ -169,22 +169,30 @@ jobs:
         # visibility lets Runtipi (and anyone else) pull the image without
         # configuring a GHCR_PAT. Idempotent — re-running on the same package
         # is a no-op.
+        #
+        # IMPORTANT: GitHub repositories owned by a *user* (not an org) live in
+        # the user namespace `/users/<login>`, not `/orgs/<login>`. The GHCR
+        # API 404s on `/orgs/Mathi5/...` because "Mathi5" is a user, not an
+        # org. We lowercase the owner to be safe — GHCR is case-sensitive and
+        # expects `mathi5`, not `Mathi5`.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PACKAGE_OWNER: ${{ github.repository_owner }}
+          # Strip any accidental uppercase; the GitHub API expects the exact
+          # canonical lowercase login for `/users/...` lookups.
+          PACKAGE_OWNER: ${{ lower(github.repository_owner) }}
           PACKAGE_NAME: crw-shield
         run: |
           set -euo pipefail
           status=$(gh api \
             -H "Accept: application/vnd.github+json" \
-            "/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
+            "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
             --jq '.visibility // empty')
           if [ "${status}" != "public" ]; then
             echo "Package visibility: ${status:-unknown} -> setting to public"
             gh api \
               --method PATCH \
               -H "Accept: application/vnd.github+json" \
-              "/orgs/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
+              "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
               -f visibility=public
           else
             echo "Package already public, skipping"
