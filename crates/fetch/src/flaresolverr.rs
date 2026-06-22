@@ -122,7 +122,7 @@ impl FlareSolverrAllowlist {
                 continue;
             }
             if let Some(suffix) = trimmed.strip_prefix("*.") {
-                out.wildcards.push(format!(".{}", suffix));
+                out.wildcards.push(format!(".{suffix}"));
             } else {
                 out.hosts.insert(trimmed.to_ascii_lowercase());
             }
@@ -134,9 +134,7 @@ impl FlareSolverrAllowlist {
     /// (comma-separated). Returns an empty allowlist when unset / blank.
     pub fn from_env() -> Self {
         match std::env::var("FLARESOLVERR_HOSTS") {
-            Ok(v) if !v.trim().is_empty() => {
-                Self::from_hosts(v.split(','))
-            }
+            Ok(v) if !v.trim().is_empty() => Self::from_hosts(v.split(',')),
             _ => Self::empty(),
         }
     }
@@ -147,11 +145,19 @@ impl FlareSolverrAllowlist {
         if self.hosts.contains(&host) {
             return true;
         }
-        // Subdomain match: "www.perimeterx.com" matches apex "perimeterx.com".
-        if let Some(dot_pos) = host.find('.') {
-            let apex = &host[dot_pos + 1..];
-            if self.hosts.contains(apex) {
-                return true;
+        // Subdomain match: "blog.cdn.perimeterx.com" matches apex
+        // "perimeterx.com" by walking the dot-separated segments and
+        // checking each suffix against the allowlist. We start from
+        // the first dot, so:
+        //   "blog.cdn.perimeterx.com" -> check "cdn.perimeterx.com" first,
+        //     then "perimeterx.com".
+        //   "www.perimeterx.com"      -> check "perimeterx.com" directly.
+        for (i, b) in host.bytes().enumerate() {
+            if b == b'.' {
+                let apex = &host[i + 1..];
+                if self.hosts.contains(apex) {
+                    return true;
+                }
             }
         }
         // Wildcard match: "x.example.com" matches suffix ".example.com".
@@ -462,11 +468,8 @@ mod tests {
 
     #[test]
     fn allowlist_mixed_hosts_and_wildcards() {
-        let allow = FlareSolverrAllowlist::from_hosts([
-            "nowsecure.nl",
-            "datadome.co",
-            "*.etsy.com",
-        ]);
+        let allow =
+            FlareSolverrAllowlist::from_hosts(["nowsecure.nl", "datadome.co", "*.etsy.com"]);
         assert_eq!(allow.len(), 3);
         assert!(allow.is_allowed("nowsecure.nl"));
         assert!(allow.is_allowed("datadome.co"));

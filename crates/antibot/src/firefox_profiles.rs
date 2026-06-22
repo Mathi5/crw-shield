@@ -29,23 +29,12 @@ use serde::{Deserialize, Serialize};
 
 /// `Sec-Ch-Ua*` Client Hint values for Firefox. **Must be empty strings
 /// on the wire** — Firefox doesn't send these headers at all.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FirefoxSecChUa {
     pub ua: String,
     pub mobile: String,
     pub platform: String,
     pub arch: String,
-}
-
-impl Default for FirefoxSecChUa {
-    fn default() -> Self {
-        Self {
-            ua: String::new(),
-            mobile: String::new(),
-            platform: String::new(),
-            arch: String::new(),
-        }
-    }
 }
 
 /// A coherent Firefox browser identity.

@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use crw_antibot::{DelayPreset, HostCounters};
 use crw_core::Config;
 use crw_fetch::{
-    CdpConfig, CdpFetcher, FetchLadder, FlareSolverrAllowlist, FlareSolverrClient,
-    HttpFetcher, TlsProxy,
+    CdpConfig, CdpFetcher, FetchLadder, FlareSolverrAllowlist, FlareSolverrClient, HttpFetcher,
+    TlsProxy,
 };
 
 use crate::handlers::CrawlJob;

@@ -104,8 +104,7 @@ async fn handle_hitl_enqueue(
     // Postgres, just /tmp. Each entry is on its own line (NDJSON) so
     // multiple concurrent enqueues don't clobber each other.
     let queue_path = PathBuf::from(HITL_QUEUE_PATH);
-    let mut line = serde_json::to_string(&entry)
-        .map_err(|e| format!("serialize entry: {e}"))?;
+    let mut line = serde_json::to_string(&entry).map_err(|e| format!("serialize entry: {e}"))?;
     line.push('\n');
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -170,8 +169,8 @@ fn handle_hitl_result(_state: &AppState, id: &str) -> Result<serde_json::Value, 
         if line.trim().is_empty() {
             continue;
         }
-        let entry: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| format!("parse queue entry: {e}"))?;
+        let entry: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("parse queue entry: {e}"))?;
         if entry.get("id").and_then(|v| v.as_str()) == Some(id) {
             return Ok(entry);
         }
@@ -237,7 +236,7 @@ async fn handle_scrape(
             "L3 Fail: ladder exhausted; auto-enqueueing HITL request"
         );
         match handle_hitl_enqueue(
-            &state,
+            state,
             HitlRequest {
                 url: url.clone(),
                 challenge_kind: Some(challenge_kind.clone()),

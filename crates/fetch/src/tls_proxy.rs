@@ -167,12 +167,7 @@ impl TlsProxyConfig {
                     .collect::<Vec<_>>()
             })
             .filter(|v: &Vec<String>| !v.is_empty())
-            .unwrap_or_else(|| {
-                DEFAULT_PROFILES
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            });
+            .unwrap_or_else(|| DEFAULT_PROFILES.iter().map(|s| s.to_string()).collect());
 
         // Make sure the initial profile is at index 0 of the ladder.
         // If the operator set both TLS_PROXY_PROFILE=firefox_120 and
@@ -229,10 +224,7 @@ impl TlsProxyConfig {
     /// Parse the port number out of the listen address for the readiness
     /// probe. Returns `None` if the address is malformed.
     pub fn port(&self) -> Option<u16> {
-        self.listen
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
+        self.listen.rsplit(':').next().and_then(|p| p.parse().ok())
     }
 }
 
@@ -325,10 +317,7 @@ impl TlsProxy {
 
     /// Internal: spawn the binary with a specific profile name. Used by
     /// both the initial `spawn` and by `rotate()` when we swap profiles.
-    async fn spawn_with_profile(
-        config: &TlsProxyConfig,
-        profile: &str,
-    ) -> Result<Child> {
+    async fn spawn_with_profile(config: &TlsProxyConfig, profile: &str) -> Result<Child> {
         Command::new(&config.binary)
             .arg("-listen")
             .arg(&config.listen)
@@ -491,8 +480,14 @@ mod tests {
     #[test]
     fn config_disabled_by_default() {
         // SAFETY: only the parent process reads this in tests, and tests
-        // run sequentially within a single test binary.
-        unsafe { std::env::remove_var("TLS_PROXY_ENABLED") };
+        // run sequentially within a single test binary. Remove every
+        // TLS_PROXY_* var so a previous test can't leak.
+        unsafe {
+            std::env::remove_var("TLS_PROXY_ENABLED");
+            std::env::remove_var("TLS_PROXY_PROFILE");
+            std::env::remove_var("TLS_PROXY_PROFILES");
+            std::env::remove_var("TLS_PROXY_ROTATION_DELAY_SECS");
+        }
         assert!(TlsProxyConfig::from_env().is_none());
     }
 
@@ -565,17 +560,21 @@ mod tests {
     #[test]
     fn custom_ladder_via_env() {
         unsafe {
+            std::env::remove_var("TLS_PROXY_PROFILE");
             std::env::set_var("TLS_PROXY_ENABLED", "true");
             std::env::set_var("TLS_PROXY_PROFILES", "firefox_117,firefox_120");
         }
         let cfg = TlsProxyConfig::from_env().expect("should be enabled");
         // The initial profile (default chrome_120) is prepended because
         // the CSV ladder didn't start with it.
-        assert_eq!(cfg.profiles, vec![
-            "chrome_120".to_string(),
-            "firefox_117".to_string(),
-            "firefox_120".to_string(),
-        ]);
+        assert_eq!(
+            cfg.profiles,
+            vec![
+                "chrome_120".to_string(),
+                "firefox_117".to_string(),
+                "firefox_120".to_string(),
+            ]
+        );
         unsafe {
             std::env::remove_var("TLS_PROXY_ENABLED");
             std::env::remove_var("TLS_PROXY_PROFILES");
@@ -591,11 +590,14 @@ mod tests {
         }
         let cfg = TlsProxyConfig::from_env().expect("should be enabled");
         // Initial profile is firefox_123 — prepended to the CSV ladder.
-        assert_eq!(cfg.profiles, vec![
-            "firefox_123".to_string(),
-            "chrome_120".to_string(),
-            "chrome_117".to_string(),
-        ]);
+        assert_eq!(
+            cfg.profiles,
+            vec![
+                "firefox_123".to_string(),
+                "chrome_120".to_string(),
+                "chrome_117".to_string(),
+            ]
+        );
         unsafe {
             std::env::remove_var("TLS_PROXY_ENABLED");
             std::env::remove_var("TLS_PROXY_PROFILE");
@@ -626,7 +628,10 @@ mod tests {
         }
         let cfg = TlsProxyConfig::from_env().expect("should be enabled");
         assert_eq!(cfg.rotation_delay, Duration::from_secs(15));
-        unsafe { std::env::remove_var("TLS_PROXY_ENABLED") };
+        unsafe {
+            std::env::remove_var("TLS_PROXY_ENABLED");
+            std::env::remove_var("TLS_PROXY_ROTATION_DELAY_SECS");
+        };
     }
 
     #[test]

@@ -215,7 +215,7 @@ impl CdpFetcher {
                 "injecting TLS proxy args into chromiumoxide config"
             );
             builder = builder
-                .arg(format!("--proxy-server={}", listen_url))
+                .arg(format!("--proxy-server={listen_url}"))
                 .arg("--ignore-certificate-errors")
                 .arg(format!("--proxy-bypass-list={}", proxy.bypass));
         }
@@ -289,11 +289,9 @@ impl CdpFetcher {
                         .map(|v| v == "true" || v == "1")
                         .unwrap_or(false)
                     {
-                        if let Err(e) = Self::warmup_profile(
-                            &browser,
-                            self.config.user_data_dir.as_deref(),
-                        )
-                        .await
+                        if let Err(e) =
+                            Self::warmup_profile(&browser, self.config.user_data_dir.as_deref())
+                                .await
                         {
                             warn!(error = %e, "profile warmup returned error (continuing)");
                         }
@@ -1318,8 +1316,8 @@ mod tests {
             .unwrap_or(0);
         // The threshold is "both > 4KB = lived-in". With both at 1KB,
         // the AND is false, so warmup would fire.
-        let would_skip =
-            cookies_size > WARMUP_LIVED_IN_THRESHOLD_BYTES && history_size > WARMUP_LIVED_IN_THRESHOLD_BYTES;
+        let would_skip = cookies_size > WARMUP_LIVED_IN_THRESHOLD_BYTES
+            && history_size > WARMUP_LIVED_IN_THRESHOLD_BYTES;
         assert!(!would_skip, "1 KB profile should trigger warmup");
         let _ = std::fs::remove_dir_all(&profile);
     }

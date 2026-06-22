@@ -74,26 +74,106 @@ struct Pattern {
 
 const PATTERNS: &[Pattern] = &[
     // Cloudflare
-    Pattern { kind: BlockKind::Cloudflare, title_weight: 0.9, body_weight: 0.3, phrase: "Just a moment" },
-    Pattern { kind: BlockKind::Cloudflare, title_weight: 0.6, body_weight: 0.4, phrase: "cf-ray" },
-    Pattern { kind: BlockKind::Cloudflare, title_weight: 0.6, body_weight: 0.4, phrase: "cf-browser-verification" },
+    Pattern {
+        kind: BlockKind::Cloudflare,
+        title_weight: 0.9,
+        body_weight: 0.3,
+        phrase: "Just a moment",
+    },
+    Pattern {
+        kind: BlockKind::Cloudflare,
+        title_weight: 0.6,
+        body_weight: 0.4,
+        phrase: "cf-ray",
+    },
+    Pattern {
+        kind: BlockKind::Cloudflare,
+        title_weight: 0.6,
+        body_weight: 0.4,
+        phrase: "cf-browser-verification",
+    },
     // PerimeterX
-    Pattern { kind: BlockKind::PerimeterX, title_weight: 0.95, body_weight: 0.3, phrase: "Access to this page has been denied" },
-    Pattern { kind: BlockKind::PerimeterX, title_weight: 0.7, body_weight: 0.5, phrase: "Press & Hold" },
-    Pattern { kind: BlockKind::PerimeterX, title_weight: 0.7, body_weight: 0.5, phrase: "Press and Hold" },
-    Pattern { kind: BlockKind::PerimeterX, title_weight: 0.6, body_weight: 0.4, phrase: "_pxAppId" },
+    Pattern {
+        kind: BlockKind::PerimeterX,
+        title_weight: 0.95,
+        body_weight: 0.3,
+        phrase: "Access to this page has been denied",
+    },
+    Pattern {
+        kind: BlockKind::PerimeterX,
+        title_weight: 0.7,
+        body_weight: 0.5,
+        phrase: "Press & Hold",
+    },
+    Pattern {
+        kind: BlockKind::PerimeterX,
+        title_weight: 0.7,
+        body_weight: 0.5,
+        phrase: "Press and Hold",
+    },
+    Pattern {
+        kind: BlockKind::PerimeterX,
+        title_weight: 0.6,
+        body_weight: 0.4,
+        phrase: "_pxAppId",
+    },
     // Datadome
-    Pattern { kind: BlockKind::Datadome, title_weight: 0.0, body_weight: 0.7, phrase: "datadome" },
-    Pattern { kind: BlockKind::Datadome, title_weight: 0.0, body_weight: 0.5, phrase: "dd.leboncoin.fr" },
+    Pattern {
+        kind: BlockKind::Datadome,
+        title_weight: 0.0,
+        body_weight: 0.7,
+        phrase: "datadome",
+    },
+    Pattern {
+        kind: BlockKind::Datadome,
+        title_weight: 0.0,
+        body_weight: 0.5,
+        phrase: "dd.leboncoin.fr",
+    },
     // AWS WAF
-    Pattern { kind: BlockKind::AwsWaf, title_weight: 0.0, body_weight: 0.9, phrase: "awswaf-token" },
-    Pattern { kind: BlockKind::AwsWaf, title_weight: 0.0, body_weight: 0.7, phrase: "/_sec/verify" },
-    Pattern { kind: BlockKind::AwsWaf, title_weight: 0.6, body_weight: 0.3, phrase: "AWS WAF" },
+    Pattern {
+        kind: BlockKind::AwsWaf,
+        title_weight: 0.0,
+        body_weight: 0.9,
+        phrase: "awswaf-token",
+    },
+    Pattern {
+        kind: BlockKind::AwsWaf,
+        title_weight: 0.0,
+        body_weight: 0.7,
+        phrase: "/_sec/verify",
+    },
+    Pattern {
+        kind: BlockKind::AwsWaf,
+        title_weight: 0.6,
+        body_weight: 0.3,
+        phrase: "AWS WAF",
+    },
     // Generic captcha
-    Pattern { kind: BlockKind::GenericCaptcha, title_weight: 0.7, body_weight: 0.3, phrase: "Robot Check" },
-    Pattern { kind: BlockKind::GenericCaptcha, title_weight: 0.6, body_weight: 0.4, phrase: "verify you are human" },
-    Pattern { kind: BlockKind::GenericCaptcha, title_weight: 0.5, body_weight: 0.5, phrase: "captcha" },
-    Pattern { kind: BlockKind::GenericCaptcha, title_weight: 0.5, body_weight: 0.5, phrase: "I am human" },
+    Pattern {
+        kind: BlockKind::GenericCaptcha,
+        title_weight: 0.7,
+        body_weight: 0.3,
+        phrase: "Robot Check",
+    },
+    Pattern {
+        kind: BlockKind::GenericCaptcha,
+        title_weight: 0.6,
+        body_weight: 0.4,
+        phrase: "verify you are human",
+    },
+    Pattern {
+        kind: BlockKind::GenericCaptcha,
+        title_weight: 0.5,
+        body_weight: 0.5,
+        phrase: "captcha",
+    },
+    Pattern {
+        kind: BlockKind::GenericCaptcha,
+        title_weight: 0.5,
+        body_weight: 0.5,
+        phrase: "I am human",
+    },
 ];
 
 /// Run the block-detection pass over an HTML response + its extracted title.
@@ -121,7 +201,7 @@ pub fn detect(html: &str, title: &str) -> Option<BlockSignal> {
             matched = format!("body contains {:?}", p.phrase);
         }
 
-        if score > 0.0 && score >= BLOCK_THRESHOLD {
+        if score >= BLOCK_THRESHOLD {
             let sig = BlockSignal {
                 kind: p.kind.clone(),
                 confidence: score,
@@ -142,14 +222,15 @@ pub fn detect(html: &str, title: &str) -> Option<BlockSignal> {
     // `<html`), it's real content even when small (e.g. example.com is
     // ~1.3 KB). Only flag when the body is *both* small AND has no HTML
     // structure — that's the block-page signature.
-    if best.is_none()
-        && html.len() < EMPTY_THRESHOLD_BYTES
-        && !looks_like_html(html)
-    {
+    if best.is_none() && html.len() < EMPTY_THRESHOLD_BYTES && !looks_like_html(html) {
         best = Some(BlockSignal {
             kind: BlockKind::Empty,
             confidence: 0.5,
-            matched: format!("page is {} bytes (threshold {})", html.len(), EMPTY_THRESHOLD_BYTES),
+            matched: format!(
+                "page is {} bytes (threshold {})",
+                html.len(),
+                EMPTY_THRESHOLD_BYTES
+            ),
         });
     }
 

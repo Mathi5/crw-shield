@@ -42,12 +42,8 @@ pub enum RotationDecision {
     /// localStorage in the same browser session and retry once. If the
     /// retry succeeds, the user gets the result. If it fails again,
     /// escalate to L2.
-    ClearAndRetry {
-        signal: BlockSignal,
-    },
-    /// L2: second+ block. Rotate to the next profile + restart Chrome
-    /// + 15 s wait. The caller is expected to invoke the rotation
-    /// handler and then re-scrape.
+    ClearAndRetry { signal: BlockSignal },
+    /// L2 (second+ block): rotate to the next profile, restart Chrome, wait 15s, then re-scrape. The caller is expected to invoke the rotation handler.
     Rotate {
         signal: BlockSignal,
         next_profile_idx: usize,
@@ -163,7 +159,9 @@ mod tests {
         // Second call: L2
         let decision = decide(html, "Just a moment...", "blocked.com", 0, &counters, 7);
         match decision {
-            RotationDecision::Rotate { next_profile_idx, .. } => {
+            RotationDecision::Rotate {
+                next_profile_idx, ..
+            } => {
                 // First L2 should jump to index 5 (Firefox)
                 assert_eq!(next_profile_idx, 5);
             }
@@ -204,8 +202,7 @@ mod tests {
         let decision = decide(html, "Just a moment...", "blocked.com", 0, &counters, 7);
         match decision {
             RotationDecision::Rotate {
-                next_profile_idx,
-                ..
+                next_profile_idx, ..
             } => {
                 assert_eq!(next_profile_idx, 5, "should jump to Firefox");
             }

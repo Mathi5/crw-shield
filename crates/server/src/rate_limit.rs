@@ -87,7 +87,10 @@ impl RateLimiter {
         match elapsed {
             Some(e) if e < required => {
                 let sleep_for = required - e;
-                debug!(sleep_ms = sleep_for.as_millis() as u64, "rate limiter sleeping");
+                debug!(
+                    sleep_ms = sleep_for.as_millis() as u64,
+                    "rate limiter sleeping"
+                );
                 drop(inner); // don't hold the lock during the sleep
                 tokio::time::sleep(sleep_for).await;
                 let mut inner = self.inner.lock().await;
@@ -112,7 +115,10 @@ impl RateLimiter {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(500);
-        Self::new(Duration::from_millis(min_ms), Duration::from_millis(jitter_ms))
+        Self::new(
+            Duration::from_millis(min_ms),
+            Duration::from_millis(jitter_ms),
+        )
     }
 }
 
@@ -121,16 +127,14 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    #[test]
-    fn disabled_limiter_is_instant() {
+    #[tokio::test]
+    async fn disabled_limiter_is_instant() {
         let l = RateLimiter::disabled();
         let start = Instant::now();
         // run 10 waits back-to-back; should take < 10ms total
-        futures::executor::block_on(async {
-            for _ in 0..10 {
-                l.wait().await;
-            }
-        });
+        for _ in 0..10 {
+            l.wait().await;
+        }
         assert!(start.elapsed() < Duration::from_millis(10));
     }
 
@@ -182,17 +186,22 @@ mod tests {
     #[tokio::test]
     async fn no_sleep_when_elapsed_exceeds_min() {
         let l = RateLimiter::new(Duration::from_millis(10), Duration::ZERO);
-        let start = Instant::now();
+        let _start = Instant::now();
         l.wait().await;
         // Wait longer than the min interval
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let mid = Instant::now();
+        let before_second_wait = Instant::now();
         l.wait().await;
-        // Should not have slept at all
+        let after_second_wait = Instant::now();
+        // The second wait should be near-instant because the elapsed
+        // time since the first wait (>= 50ms) exceeds the 10ms min interval.
+        // Allow some scheduling overhead.
         assert!(
-            mid.duration_since(start) < Duration::from_millis(20),
-            "mid elapsed too long: {}ms",
-            mid.duration_since(start).as_millis()
+            after_second_wait.duration_since(before_second_wait) < Duration::from_millis(20),
+            "second wait slept too long: {}ms",
+            after_second_wait
+                .duration_since(before_second_wait)
+                .as_millis()
         );
     }
 }

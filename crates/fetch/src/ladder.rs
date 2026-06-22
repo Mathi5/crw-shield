@@ -14,9 +14,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use crw_antibot::{
-    counter_for_host as counter_for, detect_challenge, detect_empty_or_blocked, decide_rotation,
-    diagnose_situation, CookieJar, HostCounters, L2_COOLDOWN, RotationDecision, SituationKind,
-    SituationReport, SuggestedLadder,
+    counter_for_host as counter_for, decide_rotation, detect_challenge, detect_empty_or_blocked,
+    diagnose_situation, CookieJar, HostCounters, RotationDecision, SituationKind, SituationReport,
+    SuggestedLadder, L2_COOLDOWN,
 };
 use crw_core::{Format, Result, ScrapeData, ScrapeMetadata, ScrapeRequest, ScrapeResponse};
 use tracing::{debug, info, warn};
@@ -284,11 +284,7 @@ impl FetchLadder {
         //    is unique to DataDome; `datadome` literal also).
         const RESOLVED_PAGE_THRESHOLD_DEFAULT: usize = 5_000;
         const RESOLVED_PAGE_THRESHOLD_DATADOME: usize = 1_000;
-        const DATADOME_FINGERPRINTS: &[&str] = &[
-            "geo.captcha-delivery.com",
-            "datadome",
-            "ddc.",
-        ];
+        const DATADOME_FINGERPRINTS: &[&str] = &["geo.captcha-delivery.com", "datadome", "ddc."];
         let is_datadome = DATADOME_FINGERPRINTS
             .iter()
             .any(|f| html.to_ascii_lowercase().contains(f));
@@ -319,9 +315,7 @@ impl FetchLadder {
         //    may be larger than the size threshold but still be a
         //    challenge page).
         if let Some(provider) = detect_challenge(html) {
-            return Err(format!(
-                "flaresolverr returned anti-bot page ({provider})"
-            ));
+            return Err(format!("flaresolverr returned anti-bot page ({provider})"));
         }
         // No overrides — keep the auto-diagnosed situation.
         Ok(None)
@@ -507,7 +501,7 @@ impl FetchLadder {
                             .map(|s| s.to_ascii_lowercase())
                             .unwrap_or_else(|| target.clone());
                         let domain_ok = cookie_domain == target
-                            || target.ends_with(format!(".{}", cookie_domain).as_str());
+                            || target.ends_with(format!(".{cookie_domain}").as_str());
                         if !domain_ok {
                             debug!(
                                 url = %url,
@@ -522,14 +516,13 @@ impl FetchLadder {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0);
-                            if exp > now { Some((exp - now) as u64) } else { None }
+                            if exp > now {
+                                Some((exp - now) as u64)
+                            } else {
+                                None
+                            }
                         });
-                        self.cookies.set_cookie(
-                            &target,
-                            &c.name,
-                            &c.value,
-                            max_age,
-                        );
+                        self.cookies.set_cookie(&target, &c.name, &c.value, max_age);
                         injected += 1;
                     }
                     if injected > 0 {
@@ -1323,7 +1316,8 @@ at the IANA website.</p>
 <p>Lots of additional text to push us well over the 500-char escalation
 threshold so the heuristic returns a real non-block result for the
 classifier to chew on.</p>
-</body></html>"#.into(),
+</body></html>"#
+                .into(),
             headers: Default::default(),
         };
         assert!(!FetchLadder::http_should_escalate(&fetch));
@@ -1442,7 +1436,10 @@ Definitely not a bot block page.</p>
         html.push_str("</p></body></html>");
 
         let res = FetchLadder::validate_flaresolverr_solution(&html);
-        assert!(res.is_ok(), "expected Ok for resolved CF page, got: {res:?}");
+        assert!(
+            res.is_ok(),
+            "expected Ok for resolved CF page, got: {res:?}"
+        );
     }
 
     #[test]

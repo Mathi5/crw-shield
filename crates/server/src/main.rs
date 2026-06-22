@@ -32,13 +32,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::signal::ctrl_c().await.ok();
         };
         #[cfg(unix)]
-        let terminate = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .ok()
-                .map(|mut s| async move { s.recv().await })
-                .map(|f| Box::pin(f));
-            // No-op placeholder; the simpler approach is to use a select.
-        };
+        let _terminate = async {};
         #[cfg(unix)]
         {
             use tokio::signal::unix::SignalKind;
