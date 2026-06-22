@@ -219,24 +219,30 @@ jobs:
         # API 404s on `/orgs/Mathi5/...` because "Mathi5" is a user, not an
         # org. We lowercase the owner to be safe — GHCR is case-sensitive and
         # expects `mathi5`, not `Mathi5`.
+        #
+        # We resolve the lowercased owner in a shell step rather than via a
+        # GitHub Actions expression: there is no built-in `lower()` / `toLower`
+        # function in the expressions language, only `toJson`, `fromJson`,
+        # etc. The shell `tr` is the canonical workaround.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Strip any accidental uppercase; the GitHub API expects the exact
-          # canonical lowercase login for `/users/...` lookups.
-          PACKAGE_OWNER: ${{ lower(github.repository_owner) }}
+          PACKAGE_OWNER: ${{ github.repository_owner }}
           PACKAGE_NAME: crw-shield
         run: |
           set -euo pipefail
+          # Lowercase the owner: GHCR is case-sensitive and the canonical
+          # login for our user namespace is 'mathi5', not 'Mathi5'.
+          OWNER_LOWER=$(printf '%s' "$PACKAGE_OWNER" | tr '[:upper:]' '[:lower:]')
           status=$(gh api \
             -H "Accept: application/vnd.github+json" \
-            "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
+            "/users/${OWNER_LOWER}/packages/container/${PACKAGE_NAME}" \
             --jq '.visibility // empty')
           if [ "${status}" != "public" ]; then
             echo "Package visibility: ${status:-unknown} -> setting to public"
             gh api \
               --method PATCH \
               -H "Accept: application/vnd.github+json" \
-              "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME}" \
+              "/users/${OWNER_LOWER}/packages/container/${PACKAGE_NAME}" \
               -f visibility=public
           else
             echo "Package already public, skipping"
