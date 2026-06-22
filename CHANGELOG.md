@@ -32,7 +32,7 @@ First public release.
   multi-platform build (linux x86_64/arm64, darwin x86_64/arm64),
   GitHub Release with attached binaries, Docker image push to GHCR
 
-### Bench (30-site panel, residential Freebox IP)
+### Bench (30-site panel, residential IP)
 - 29/30 = 96.7% / 299 700 chars
 - T1: 7/7 = 100%, T2: 11/12 = 92%, T3: 11/11 = 100%
 - Single remaining failure: youtube.com (streaming, out of scope)
