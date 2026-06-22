@@ -256,27 +256,48 @@ impl FetchLadder {
     fn validate_flaresolverr_solution(
         html: &str,
     ) -> std::result::Result<Option<SituationKind>, String> {
-        // 0. (Light.4) — large resolved pages with a <title> tag are
-        //    legitimate even if their markup still contains CF / DataDome
-        //    fingerprints (challenge-platform scripts, inline anti-bot
-        //    tokens). FlareSolverr's response is the *real* page once the
-        //    challenge is solved — the fingerprints are inert JS.
-        //    Rejecting those was a false positive that left every FS
-        //    fetch stuck in HITL_REQUIRED (nowsecure.nl 179k chars was
-        //    being thrown away, datadome.co 1.4k chars too).
+        // 0. (Light.4 + Light.5) — large resolved pages with a <title> tag
+        //    are legitimate even if their markup still contains CF /
+        //    DataDome fingerprints (challenge-platform scripts, inline
+        //    anti-bot tokens). FlareSolverr's response is the *real* page
+        //    once the challenge is solved — the fingerprints are inert JS.
+        //    Rejecting those was a false positive that left every FS fetch
+        //    stuck in HITL_REQUIRED (nowsecure.nl 179k chars was being
+        //    thrown away, datadome.co 1.4k chars too).
         //    IMPORTANT: this check must run *before* the generic
-        //    detect_empty_or_blocked below — that helper classifies
-        //    pages with residual CF fingerprints as anti-bot (via
-        //    `is_anti_bot()`), so the resolved-page escape hatch needs
-        //    to fire first.
+        //    detect_empty_or_blocked below — that helper classifies pages
+        //    with residual CF fingerprints as anti-bot (via `is_anti_bot()`),
+        //    so the resolved-page escape hatch needs to fire first.
         //
-        //    Returning `Ok(Some(CleanSuccess))` tells the caller to
-        //    override the auto-diagnosed situation (which would still
-        //    say `CloudflareIuam` based on the residual fingerprint),
-        //    otherwise the upstream `is_anti_bot()` gate in
-        //    handlers.rs would still flip the response to HITL_REQUIRED.
-        const RESOLVED_PAGE_THRESHOLD: usize = 5_000;
-        if html.len() > RESOLVED_PAGE_THRESHOLD && html.contains("<title") {
+        //    Returning `Ok(Some(CleanSuccess))` tells the caller to override
+        //    the auto-diagnosed situation (which would still say
+        //    `CloudflareIuam` based on the residual fingerprint), otherwise
+        //    the upstream `is_anti_bot()` gate in handlers.rs would still
+        //    flip the response to HITL_REQUIRED.
+        //
+        //    Light.5 (2026-06-22) — DataDome top-tier sites (etsy.com,
+        //    datadome.co) resolve to small challenge pages (~1.4k chars)
+        //    because their post-challenge home is a cookie-bearing stub
+        //    that the browser fills client-side. We accept these by
+        //    lowering the threshold to 1 000 chars when the HTML contains
+        //    a DataDome-specific fingerprint (`geo.captcha-delivery.com`
+        //    is unique to DataDome; `datadome` literal also).
+        const RESOLVED_PAGE_THRESHOLD_DEFAULT: usize = 5_000;
+        const RESOLVED_PAGE_THRESHOLD_DATADOME: usize = 1_000;
+        const DATADOME_FINGERPRINTS: &[&str] = &[
+            "geo.captcha-delivery.com",
+            "datadome",
+            "ddc.",
+        ];
+        let is_datadome = DATADOME_FINGERPRINTS
+            .iter()
+            .any(|f| html.to_ascii_lowercase().contains(f));
+        let threshold = if is_datadome {
+            RESOLVED_PAGE_THRESHOLD_DATADOME
+        } else {
+            RESOLVED_PAGE_THRESHOLD_DEFAULT
+        };
+        if html.len() > threshold && html.contains("<title") {
             return Ok(Some(crw_antibot::SituationKind::CleanSuccess));
         }
         // 1. Classify the HTML into a situation kind so we can name the
@@ -461,6 +482,63 @@ impl FetchLadder {
                     }
                     Ok(None) => {
                         // No override; keep the auto-diagnosed situation.
+                    }
+                }
+
+                // ---- Sous-phase 2: cookie injection post-FS ----
+                // FlareSolverr's solved HTML often comes with `cf_clearance`,
+                // `__cf_bm`, `datadome`, or vendor-specific cookies that
+                // future HTTP/CDP attempts on the same host should reuse.
+                // Without injection, a retry would re-trigger the challenge
+                // and the operator would have to hit FS every single time.
+                //
+                // We inject only cookies whose `domain` matches the target
+                // host (exact or parent), so we never leak FS cookies across
+                // sites (Pitfall: cookie domain attribute can be an apex
+                // like "perimeterx.com" which matches "www.perimeterx.com").
+                if let Some(host_str) = &host {
+                    let target = host_str.to_ascii_lowercase();
+                    let mut injected = 0usize;
+                    for c in &solution.cookies {
+                        let cookie_domain = c
+                            .domain
+                            .as_deref()
+                            .map(|s| s.trim_start_matches('.'))
+                            .map(|s| s.to_ascii_lowercase())
+                            .unwrap_or_else(|| target.clone());
+                        let domain_ok = cookie_domain == target
+                            || target.ends_with(format!(".{}", cookie_domain).as_str());
+                        if !domain_ok {
+                            debug!(
+                                url = %url,
+                                cookie = %c.name,
+                                domain = %cookie_domain,
+                                "Skipping FS cookie: domain mismatch"
+                            );
+                            continue;
+                        }
+                        let max_age = c.expires.and_then(|exp| {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            if exp > now { Some((exp - now) as u64) } else { None }
+                        });
+                        self.cookies.set_cookie(
+                            &target,
+                            &c.name,
+                            &c.value,
+                            max_age,
+                        );
+                        injected += 1;
+                    }
+                    if injected > 0 {
+                        info!(
+                            url = %url,
+                            host = %target,
+                            count = injected,
+                            "Injected FlareSolverr cookies into shared CookieJar"
+                        );
                     }
                 }
 
@@ -1380,5 +1458,58 @@ Definitely not a bot block page.</p>
 </body></html>"#;
         let res = FetchLadder::validate_flaresolverr_solution(html);
         assert!(res.is_err(), "expected Err for short CF challenge, got Ok");
+    }
+
+    #[test]
+    fn validate_flaresolverr_solution_accepts_short_datadome_resolved_page() {
+        // Light.5 (2026-06-22) — DataDome top-tier sites (etsy.com,
+        // datadome.co) resolve to small challenge pages (~1.4k chars)
+        // because their post-challenge home is a cookie-bearing stub.
+        // The HTML contains a DataDome-specific fingerprint
+        // (`geo.captcha-delivery.com` is unique to DataDome), so the
+        // threshold drops to 1 000 chars and the page is accepted.
+        let mut html = String::from(
+            r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Loading...</title>
+<script src="https://geo.captcha-delivery.com/captcha.js"></script>
+</head>
+<body>
+<noscript>datadome challenge</noscript>
+<p>"#,
+        );
+        // Pad to >1000 chars to clear the DataDome threshold.
+        html.push_str(&"x".repeat(1100));
+        html.push_str("</p></body></html>");
+
+        let res = FetchLadder::validate_flaresolverr_solution(&html);
+        assert!(
+            res.is_ok(),
+            "expected Ok for resolved DataDome page (>1k chars + DD fingerprint), got: {res:?}"
+        );
+        let kind = res.unwrap();
+        assert_eq!(
+            kind,
+            Some(crw_antibot::SituationKind::CleanSuccess),
+            "Light.5 should override kind to CleanSuccess"
+        );
+    }
+
+    #[test]
+    fn validate_flaresolverr_solution_still_rejects_short_datadome_challenge() {
+        // Below the 1 000 char DataDome threshold, even a DD-fingerprinted
+        // page is rejected (could be a teaser / interstitial).
+        let html = r#"<!DOCTYPE html>
+<html><head><title>DD check</title></head>
+<body><script src="https://geo.captcha-delivery.com/captcha.js"></script></body>
+</html>"#;
+        // ~145 chars < 1 000 → no override → check 1/2/3 fires
+        // detect_challenge should catch the datadome fingerprint.
+        let res = FetchLadder::validate_flaresolverr_solution(html);
+        assert!(
+            res.is_err(),
+            "expected Err for short DataDome page (<1k chars), got Ok: {res:?}"
+        );
     }
 }
