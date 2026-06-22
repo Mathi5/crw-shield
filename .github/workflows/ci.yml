@@ -37,3 +37,12 @@ jobs:
 
       - name: Test
         run: cargo test --all --locked
+
+      - name: Test with firecrawl-extractor feature
+        # Phase D: validate the optional Firecrawl html-extractor path
+        # builds and tests pass with the feature enabled. Off by default
+        # in production but exercised in CI to catch upstream API churn.
+        run: cargo test --all --locked --features crw-extract/firecrawl-extractor
+
+      - name: Clippy with firecrawl-extractor feature
+        run: cargo clippy --all --all-targets --features crw-extract/firecrawl-extractor -- -D warnings

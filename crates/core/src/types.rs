@@ -215,6 +215,14 @@ pub struct ScrapeMetadata {
     /// "empty".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction_reason: Option<String>,
+    /// Phase D: first `<script type="application/ld+json">` block parsed
+    /// as JSON. Schema.org structured data is what Firecrawl exposes for
+    /// typed entity extraction (recipes, products, articles). We surface
+    /// it here so clients can do their own typed extraction without
+    /// re-fetching. `None` when no JSON-LD is present or the JSON is
+    /// invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_org_data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

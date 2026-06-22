@@ -1,5 +1,8 @@
 target/
 
+# Hermes agent working directory — internal plans/notes/memory, never track.
+.hermes/
+
 # Internal research / planning / bench notes — never track.
 # Only the following are public docs:
 #   README.md, CHANGELOG.md, DEVELOPING.md, RELEASING.md,

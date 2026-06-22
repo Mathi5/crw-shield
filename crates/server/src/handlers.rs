@@ -14,7 +14,7 @@ use crw_core::{
 };
 use crw_crawl::{crw_crawl, FetcherScrapeRunner};
 use crw_extract::{
-    extract_links, extract_main_content_v3, extract_metadata, filter_tags, html_to_markdown,
+    extract_links, extract_main_content_v4, extract_metadata, filter_tags, html_to_markdown,
 };
 use crw_map::discover as map_discover;
 use crw_search::SearchClient;
@@ -295,15 +295,24 @@ async fn handle_scrape(
     let mut extraction_reason: Option<String> = None;
 
     if req.only_main_content {
-        // Phase C: situation-aware extraction. v3 consults the
-        // SituationReport to short-circuit on SoftNotFound / JsOnly /
-        // anti-bot blocks — producing a tagged reason so the API
-        // response makes the diagnosis clear.
-        let v3 = extract_main_content_v3(&html_for_extraction, Some(&situation));
-        html_for_extraction = v3.result.markdown;
-        extraction_quality = Some(v3.result.quality);
-        page_type = Some(format!("{:?}", v3.result.page_type).to_lowercase());
-        extraction_reason = Some(format!("{:?}", v3.reason).to_lowercase());
+        // Phase D: page-type-aware extraction router. v4 reuses v3's
+        // situation-awareness (SoftNotFound / JsOnly / anti-bot blocks
+        // short-circuit with a tagged reason) AND, when the page-type is
+        // Article or Doc, delegates to the optional firecrawl-extractor
+        // pipeline for better scoring + fallback chain.
+        //
+        // The URL is forwarded to the Firecrawl extractor so it can rewrite
+        // relative links and use the URL for page-type scoring position
+        // hints. With the feature off, the url argument is ignored.
+        let v4 = extract_main_content_v4(
+            &html_for_extraction,
+            Some(&situation),
+            &fetch_result.final_url,
+        );
+        html_for_extraction = v4.result.markdown;
+        extraction_quality = Some(v4.result.quality);
+        page_type = Some(format!("{:?}", v4.result.page_type).to_lowercase());
+        extraction_reason = Some(format!("{:?}", v4.reason).to_lowercase());
     }
     if !req.include_tags.is_empty() || !req.exclude_tags.is_empty() {
         html_for_extraction =

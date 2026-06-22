@@ -81,6 +81,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # In-memory cache
 moka = { version = "0.12", features = ["future"] }
 
+# (Firecrawl html-extractor dep lives in crates/extract/Cargo.toml, not
+# workspace, so it can be marked optional and gated behind a feature flag.
+# Pin: rev=0a2b743 is the last commit on main, Jun 22 2026.
+# See crates/extract/Cargo.toml for the actual dep declaration.)
+
 # Futures utilities
 futures = "0.3"
 
