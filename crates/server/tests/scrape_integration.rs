@@ -22,10 +22,7 @@ use tokio::sync::Mutex;
 static HITL_QUEUE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 async fn hitl_queue_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    HITL_QUEUE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .await
+    HITL_QUEUE_LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
 
 /// Helper: set `HITL_QUEUE_PATH` to a temp file, pre-seed it with one entry
