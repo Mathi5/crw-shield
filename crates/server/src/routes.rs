@@ -5,8 +5,8 @@ use axum::{
 use tower::ServiceBuilder;
 
 use crate::handlers::{
-    crawl_cancel, crawl_start, crawl_status, health, hitl_enqueue, hitl_result, hitl_solve, map,
-    scrape, search,
+    crawl_cancel, crawl_start, crawl_status, health, hitl_enqueue, hitl_result, hitl_solve,
+    hitl_solve_ui_get, hitl_solve_ui_post, map, scrape, search,
 };
 use crate::middleware::auth_middleware;
 use crate::state::AppState;
@@ -19,6 +19,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/scrape/hitl", post(hitl_enqueue))
         .route("/v2/scrape/hitl/result", get(hitl_result))
         .route("/v2/scrape/hitl/:id/solve", post(hitl_solve))
+        // Self-service solve UI: GET renders the form, POST accepts the form
+        // submission. Both call the same `handle_hitl_solve` core under the
+        // hood, so the JSON endpoint stays available for programmatic use.
+        .route(
+            "/v2/scrape/hitl/:id/solve-ui",
+            get(hitl_solve_ui_get).post(hitl_solve_ui_post),
+        )
         .route("/v2/crawl", post(crawl_start))
         .route("/v2/crawl/:id", get(crawl_status))
         .route("/v2/crawl/:id", delete(crawl_cancel))
