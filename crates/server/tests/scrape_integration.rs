@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -5,9 +6,31 @@ use crw_core::{Config, ScrapeRequest};
 use crw_server::{build_router, AppState};
 use mockito::Server;
 use serde_json::json;
+use tokio::sync::Mutex;
+
+/// Global mutex serializing every test that touches the `HITL_QUEUE_PATH`
+/// env var. The env var is process-global, so concurrent tests that each
+/// seed their own queue file will stomp on each other and intermittently
+/// see 404s (their entry isn't in the path the server is currently
+/// reading). Tests grab this lock before `seed_hitl_queue` and release
+/// it at the end. Cheap, predictable, no other infrastructure needed.
+///
+/// We use `tokio::sync::Mutex` (not `std::sync::Mutex`) so the guard is
+/// held safely across `.await` points — the tests do real HTTP I/O on
+/// the spawned app, and `std::sync::MutexGuard` across an await can
+/// deadlock the runtime if the runtime happens to be single-threaded.
+static HITL_QUEUE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+async fn hitl_queue_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    HITL_QUEUE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await
+}
 
 /// Helper: set `HITL_QUEUE_PATH` to a temp file, pre-seed it with one entry
 /// for `id` / `url` (status=pending), and return the temp path.
+/// MUST be called while holding the `hitl_queue_lock()` guard — see its docs.
 fn seed_hitl_queue(id: &str, url: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("crw-hitl-test-{}.json", uuid::Uuid::new_v4()));
@@ -334,6 +357,7 @@ async fn auth_token_enforced_when_set() {
 
 #[tokio::test]
 async fn hitl_solve_ui_get_returns_404_for_unknown_id() {
+    let _lock = hitl_queue_lock().await;
     let prev = std::env::var("HITL_QUEUE_PATH").ok();
     let path = std::env::temp_dir().join(format!("crw-hitl-empty-{}.json", uuid::Uuid::new_v4()));
     std::fs::write(&path, "").unwrap();
@@ -364,6 +388,7 @@ async fn hitl_solve_ui_get_returns_404_for_unknown_id() {
 
 #[tokio::test]
 async fn hitl_solve_ui_get_returns_form_with_entry() {
+    let _lock = hitl_queue_lock().await;
     let prev = std::env::var("HITL_QUEUE_PATH").ok();
     let id = "abc-test-pending-0001";
     let path = seed_hitl_queue(id, "https://example.com/secure");
@@ -390,6 +415,7 @@ async fn hitl_solve_ui_get_returns_form_with_entry() {
 
 #[tokio::test]
 async fn hitl_solve_ui_post_with_raw_document_cookie() {
+    let _lock = hitl_queue_lock().await;
     let prev = std::env::var("HITL_QUEUE_PATH").ok();
     let id = "abc-test-raw-0002";
     let path = seed_hitl_queue(id, "https://cookies.test/");
@@ -447,6 +473,7 @@ async fn hitl_solve_ui_post_with_raw_document_cookie() {
 
 #[tokio::test]
 async fn hitl_solve_ui_post_with_json_array() {
+    let _lock = hitl_queue_lock().await;
     let prev = std::env::var("HITL_QUEUE_PATH").ok();
     let id = "abc-test-json-0003";
     let path = seed_hitl_queue(id, "https://json.test/path");
