@@ -5,6 +5,51 @@ All notable changes to crw-shield are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-23
+
+### Added
+- **Cookie jar disk persistence**. `CookieJar::save_to_path()` /
+  `load_from_path()` with atomic writes (`.tmp` + rename) and
+  `expires_at_unix` filtering on load. Default persistence path is
+  `/var/lib/crw-shield/cookies.json` (override with
+  `COOKIE_PERSISTENCE_PATH`, empty value = in-memory only). The server
+  seeds the shared jar from disk at startup and spawns a 60-second
+  background task that snapshots it back. Fixes the silent regression
+  where every container restart lost `cf_clearance`, `__cf_bm`, and
+  vendor-specific session cookies.
+- **HITL solve endpoint**: `POST /v2/scrape/hitl/:id/solve` accepts
+  `{cookies: [{name, value, domain, max_age_secs}]}`, injects them
+  into the shared `CookieJar`, marks the queue entry as `solved`,
+  and snapshots the jar to disk immediately. Closes the loop on
+  the existing `hitl_enqueue` / `hitl_result` pair — previously there
+  was no way to mark an entry solved.
+- **Discord webhook notification on HITL**. When
+  `DISCORD_WEBHOOK_HITL_URL` is set, every auto-enqueued HITL pings
+  the webhook with the challenge kind, URL, id, and a ready-to-paste
+  `curl` solve command. Fire-and-forget (`tokio::spawn`, 5s timeout)
+  so a Discord outage never blocks scrapes.
+
+### Internal
+- Cookie entry shape migrated from `Option<SystemTime>` to
+  `Option<u64>` (Unix epoch seconds) so the in-memory and on-disk
+  formats share one representation. Public API of `CookieJar` is
+  unchanged from the caller's perspective.
+
+## [0.2.1] - 2026-06-23
+
+### Fixed
+- `Fastly Compute@Edge` bot-management challenge pages (LeMonde,
+  others) were classified as `CleanSuccess` and returned as if they
+  were real content. Added `[providers.fastly_edge_challenge]`
+  detection in `providers.toml` (matches `<title>Client Challenge</title>`,
+  `/_fs-ch-{HASH}/` asset prefix, `loading-error` div, generic
+  "A required part of this site couldn't load..." banner) and a
+  new `SituationKind::FastlyEdgeChallenge` variant that escalates
+  to the CDP ladder with `Cdp` as the suggested step.
+- `chromiumoxide=off` in the server `EnvFilter` to silence the
+  cosmetic `WS Invalid message: data did not match any variant of
+  untagged enum Message` warnings that ship with every CDP fetch.
+
 ## [0.2.0] - 2026-06-22
 
 ### Added

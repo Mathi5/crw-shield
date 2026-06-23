@@ -20,6 +20,15 @@ pub struct Config {
     pub proxy_sticky_sessions: bool,
     pub proxy_cooldown_secs: u64,
     pub flaresolverr_url: Option<String>,
+    /// Discord webhook URL to ping when an auto-enqueued HITL request is
+    /// created. Empty (`None`) means "do not notify". Set in Runtipi via the
+    /// `DISCORD_WEBHOOK_HITL_URL` env var.
+    pub discord_webhook_hitl_url: Option<String>,
+    /// Where the shared `CookieJar` is persisted to (and loaded from at
+    /// startup). Default is `/var/lib/crw-shield/cookies.json` because that
+    /// is the Runtipi-managed data path. Empty (`None`) means "do not
+    /// persist" — in-memory only.
+    pub cookie_persistence_path: Option<String>,
 }
 
 impl Default for Config {
@@ -42,6 +51,8 @@ impl Default for Config {
             proxy_sticky_sessions: true,
             proxy_cooldown_secs: 300,
             flaresolverr_url: None,
+            discord_webhook_hitl_url: None,
+            cookie_persistence_path: Some("/var/lib/crw-shield/cookies.json".to_string()),
         }
     }
 }
@@ -123,6 +134,16 @@ impl Config {
                 cfg.flaresolverr_url = Some(v);
             }
         }
+        if let Ok(v) = env::var("DISCORD_WEBHOOK_HITL_URL") {
+            if !v.is_empty() {
+                cfg.discord_webhook_hitl_url = Some(v);
+            }
+        }
+        // `COOKIE_PERSISTENCE_PATH=""` (empty) means "do not persist" —
+        // the field stays `None` and the server keeps an in-memory only jar.
+        if let Ok(v) = env::var("COOKIE_PERSISTENCE_PATH") {
+            cfg.cookie_persistence_path = if v.is_empty() { None } else { Some(v) };
+        }
 
         Ok(cfg)
     }
@@ -167,6 +188,8 @@ mod tests {
         std::env::set_var("STEALTH_ENABLED", "false");
         std::env::set_var("SEARXNG_URL", "http://example.com/");
         std::env::set_var("CRAWL_MAX_CONCURRENCY", "10");
+        std::env::set_var("DISCORD_WEBHOOK_HITL_URL", "https://discord.com/api/webhooks/abc");
+        std::env::set_var("COOKIE_PERSISTENCE_PATH", "/tmp/cookies.json");
 
         let cfg = Config::from_env().unwrap();
         assert_eq!(cfg.port, 4321);
@@ -174,12 +197,24 @@ mod tests {
         assert!(!cfg.stealth_enabled);
         assert_eq!(cfg.searxng_url.as_deref(), Some("http://example.com/"));
         assert_eq!(cfg.crawl_max_concurrency, 10);
+        assert_eq!(
+            cfg.discord_webhook_hitl_url.as_deref(),
+            Some("https://discord.com/api/webhooks/abc")
+        );
+        assert_eq!(cfg.cookie_persistence_path.as_deref(), Some("/tmp/cookies.json"));
+
+        // Empty COOKIE_PERSISTENCE_PATH means "do not persist".
+        std::env::set_var("COOKIE_PERSISTENCE_PATH", "");
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.cookie_persistence_path.is_none());
 
         std::env::remove_var("PORT");
         std::env::remove_var("AUTH_TOKEN");
         std::env::remove_var("STEALTH_ENABLED");
         std::env::remove_var("SEARXNG_URL");
         std::env::remove_var("CRAWL_MAX_CONCURRENCY");
+        std::env::remove_var("DISCORD_WEBHOOK_HITL_URL");
+        std::env::remove_var("COOKIE_PERSISTENCE_PATH");
     }
 
     #[test]

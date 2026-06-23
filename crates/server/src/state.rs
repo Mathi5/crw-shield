@@ -114,6 +114,20 @@ impl AppState {
                 .with_tls_proxy_opt(tls_proxy.clone())
                 .with_flaresolverr_allowlist(fs_allowlist),
         );
+        // Load any persisted cookies from disk (e.g. cf_clearance resolved by
+        // a previous HITL). The HTTP + CDP fetchers all share `ladder.cookies()`
+        // — we just re-seed it from the saved file. A load failure is logged
+        // and ignored; the jar starts empty and the next scrape will collect
+        // whatever the upstream site sends back.
+        Self::seed_cookie_jar(&ladder, config.cookie_persistence_path.as_deref());
+        // Spawn a background task that snapshots the cookie jar to disk
+        // every 60s. Lets cf_clearance / session cookies survive a
+        // container restart. Skipped when no persistence path is set
+        // (in-memory only mode).
+        Self::spawn_cookie_persistence_loop(
+            ladder.cookies(),
+            config.cookie_persistence_path.clone(),
+        );
         Self {
             config: Arc::new(config),
             ladder,
@@ -123,6 +137,90 @@ impl AppState {
             tls_proxy,
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_env()),
         }
+    }
+
+    /// Re-seed the shared cookie jar from a JSON file (if any). Missing
+    /// file = empty jar (first boot), corrupt file = warning + empty jar.
+    fn seed_cookie_jar(
+        ladder: &Arc<FetchLadder>,
+        path: Option<&str>,
+    ) {
+        let Some(path_str) = path else {
+            tracing::info!("cookie persistence disabled (no COOKIE_PERSISTENCE_PATH)");
+            return;
+        };
+        let path = std::path::Path::new(path_str);
+        match crw_antibot::CookieJar::load_from_path(path) {
+            Ok(loaded) => {
+                let count = loaded.iter().len();
+                if count == 0 {
+                    tracing::info!(path = %path.display(), "cookie jar loaded (empty)");
+                    return;
+                }
+                let shared = ladder.cookies();
+                for (host, name, value, expires_at_unix) in loaded.iter() {
+                    // Convert absolute Unix expiry into a relative "seconds
+                    // from now" so `set_cookie` can store it. A 0-second
+                    // remaining lifetime is treated as "expired immediately"
+                    // by `set_cookie` (see cookie_jar.rs), which is what we
+                    // want for cookies whose deadline is already in the past.
+                    let max_age_secs = expires_at_unix.map(|unix| {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        unix.saturating_sub(now)
+                    });
+                    shared.set_cookie(&host, &name, &value, max_age_secs);
+                }
+                tracing::info!(
+                    path = %path.display(),
+                    cookies = count,
+                    "cookie jar re-seeded from disk"
+                );
+            }
+            Err(e) if e.to_string().contains("missing") || e.to_string().contains("not found") => {
+                tracing::info!(path = %path.display(), "no cookie jar on disk yet (first boot)");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to load cookie jar; starting empty"
+                );
+            }
+        }
+    }
+
+    /// Spawn a tokio task that periodically saves the cookie jar to disk
+    /// so the next restart can pick it up. Cancelled on server shutdown
+    /// (the task holds only `Arc`s and an owned `PathBuf`).
+    fn spawn_cookie_persistence_loop(
+        jar: Arc<crw_antibot::CookieJar>,
+        path: Option<String>,
+    ) {
+        let Some(path_str) = path else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path_str);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // First tick fires immediately; skip it (we just loaded, nothing
+            // to save yet).
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(e) = jar.save_to_path(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to persist cookie jar"
+                    );
+                } else {
+                    tracing::debug!(path = %path.display(), "cookie jar persisted");
+                }
+            }
+        });
     }
 
     /// Synchronous wrapper for callers that don't need to await the
@@ -165,6 +263,9 @@ impl AppState {
                 .with_tls_proxy_opt(None)
                 .with_flaresolverr_allowlist(fs_allowlist),
         );
+        // Sync path: we cannot `await` the tokio background save loop here,
+        // but seeding the jar from disk is synchronous and works in tests.
+        Self::seed_cookie_jar(&ladder, config.cookie_persistence_path.as_deref());
         Self {
             config: Arc::new(config),
             ladder,
