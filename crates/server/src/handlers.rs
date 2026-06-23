@@ -1,8 +1,8 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
-    Json,
+    Form, Json,
 };
 use base64::Engine;
 use chrono::Utc;
@@ -61,7 +61,20 @@ pub struct HitlEnqueueResponse {
     pub created_at: String,
 }
 
-const HITL_QUEUE_PATH: &str = "/tmp/hitl_queue.json";
+const HITL_QUEUE_PATH_DEFAULT: &str = "/tmp/hitl_queue.json";
+
+/// Resolve the path to the HITL queue file. Defaults to
+/// `/tmp/hitl_queue.json` (the headless-container convention), but can be
+/// overridden via the `HITL_QUEUE_PATH` env var so tests can point at a
+/// temp file without touching the real queue.
+fn hitl_queue_path() -> PathBuf {
+    PathBuf::from(
+        std::env::var("HITL_QUEUE_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| HITL_QUEUE_PATH_DEFAULT.to_string()),
+    )
+}
 
 /// POST /v2/scrape/hitl
 ///
@@ -103,7 +116,7 @@ async fn handle_hitl_enqueue(
     // queue because we're running in a headless container — no Redis, no
     // Postgres, just /tmp. Each entry is on its own line (NDJSON) so
     // multiple concurrent enqueues don't clobber each other.
-    let queue_path = PathBuf::from(HITL_QUEUE_PATH);
+    let queue_path = hitl_queue_path();
     let mut line = serde_json::to_string(&entry).map_err(|e| format!("serialize entry: {e}"))?;
     line.push('\n');
     use std::io::Write;
@@ -120,13 +133,13 @@ async fn handle_hitl_enqueue(
         success: true,
         hitl_required: true,
         id: id_for_response,
-        queue_file: HITL_QUEUE_PATH.to_string(),
+        queue_file: HITL_QUEUE_PATH_DEFAULT.to_string(),
         instructions: format!(
             "Open {} in a visible browser, solve the challenge, then write \
              the resulting cookies (name=value; domain=...) to {} with id={} \
              and status='solved'. A subsequent /v2/scrape call with these \
              cookies will succeed.",
-            req.url, HITL_QUEUE_PATH, id
+            req.url, HITL_QUEUE_PATH_DEFAULT, id
         ),
         created_at: now.to_rfc3339(),
     })
@@ -160,7 +173,7 @@ pub struct HitlResultQuery {
 }
 
 fn handle_hitl_result(_state: &AppState, id: &str) -> Result<serde_json::Value, String> {
-    let queue_path = PathBuf::from(HITL_QUEUE_PATH);
+    let queue_path = hitl_queue_path();
     let content = std::fs::read_to_string(&queue_path)
         .map_err(|e| format!("read queue file {}: {e}", queue_path.display()))?;
     // Find the line whose `id` field matches the requested id. NDJSON
@@ -227,7 +240,7 @@ async fn handle_hitl_solve(
             json!({"success": false, "error": "no cookies provided"}),
         ));
     }
-    let queue_path = PathBuf::from(HITL_QUEUE_PATH);
+    let queue_path = hitl_queue_path();
     let content = std::fs::read_to_string(&queue_path).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -284,17 +297,12 @@ async fn handle_hitl_solve(
             let shared_jar = state.ladder.cookies();
             for c in &req.cookies {
                 let cookie_host = c.domain.clone().unwrap_or_else(|| resolved_host.clone());
-                shared_jar.set_cookie(
-                    &cookie_host,
-                    &c.name,
-                    &c.value,
-                    c.max_age_secs,
-                );
+                shared_jar.set_cookie(&cookie_host, &c.name, &c.value, c.max_age_secs);
             }
             // Snapshot the jar to disk RIGHT NOW (don't wait 60s for the
             // background loop) so a server restart immediately after
             // `solve` doesn't lose the cookies.
-            if let Some(path) = state.config.cookie_persistence_path.as_deref() {
+            if let Some(path) = state.cookie_persistence_path.as_deref() {
                 let p = std::path::Path::new(path);
                 if let Err(e) = shared_jar.save_to_path(p) {
                     warn!(path = %p.display(), error = %e,
@@ -308,14 +316,8 @@ async fn handle_hitl_solve(
             let mut new_entry = entry.clone();
             if let Some(obj) = new_entry.as_object_mut() {
                 obj.insert("status".to_string(), json!("solved"));
-                obj.insert(
-                    "solved_at".to_string(),
-                    json!(Utc::now().to_rfc3339()),
-                );
-                obj.insert(
-                    "cookies_stored".to_string(),
-                    json!(req.cookies.len()),
-                );
+                obj.insert("solved_at".to_string(), json!(Utc::now().to_rfc3339()));
+                obj.insert("cookies_stored".to_string(), json!(req.cookies.len()));
                 obj.insert("host".to_string(), json!(resolved_host));
             }
             updated_entry = Some(new_entry.clone());
@@ -372,12 +374,22 @@ async fn handle_hitl_solve(
 /// tokio task with a 5-second timeout. Failures are logged as warnings.
 fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &str) {
     let Some(webhook_url) = state.config.discord_webhook_hitl_url.clone() else {
+        warn!(
+            hitl_id = %hitl_id,
+            "HITL webhook skipped: DISCORD_WEBHOOK_HITL_URL not configured"
+        );
         return;
     };
+    info!(
+        hitl_id = %hitl_id,
+        webhook_host = %webhook_url.split("://").nth(1).unwrap_or("?").split('/').next().unwrap_or("?"),
+        "HITL webhook firing"
+    );
     let id_owned = hitl_id.to_string();
     let kind_owned = kind.to_string();
     let url_owned = url.to_string();
-    let bind = state.config.bind_addr();
+    let bind = state.config.public_base_url();
+    let solve_ui_link = format!("http://{bind}/v2/scrape/hitl/{hitl_id}/solve-ui");
     tokio::spawn(async move {
         let payload = json!({
             "content": format!(
@@ -386,7 +398,10 @@ fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &
                  **url**: <{url}>\n\
                  **id**: `{id}`\n\
                  \n\
-                 Solve in a visible browser, then:\n\
+                 👉 **Solve in browser**: <{solve_ui_link}>\n\
+                 *(requires the network you receive this Discord in to reach `{bind}`)*\n\
+                 \n\
+                 Or programmatically:\n\
                  ```bash\n\
                  curl -X POST http://{bind}/v2/scrape/hitl/{id}/solve \\\n\
                    -H 'Content-Type: application/json' \\\n\
@@ -397,6 +412,7 @@ fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &
                 url = url_owned,
                 id = id_owned,
                 bind = bind,
+                solve_ui_link = solve_ui_link,
             )
         });
         let client = reqwest::Client::builder()
@@ -410,15 +426,28 @@ fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &
             }
         };
         match client.post(&webhook_url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(hitl_id = %id_owned, "HITL Discord webhook delivered");
-            }
             Ok(resp) => {
-                warn!(
-                    hitl_id = %id_owned,
-                    status = %resp.status(),
-                    "HITL Discord webhook returned non-2xx"
-                );
+                let status = resp.status();
+                // Discord webhook responses with a non-204 status still carry a
+                // JSON error body (e.g. `{"message":"Invalid Webhook Token",
+                // "code":50027}` with HTTP 400). Read the body before deciding
+                // success vs. failure so we don't silently swallow rejections.
+                let body = resp.text().await.unwrap_or_default();
+                if status.is_success() && body.trim().is_empty() {
+                    info!(
+                        hitl_id = %id_owned,
+                        status = %status,
+                        "HITL Discord webhook delivered"
+                    );
+                } else {
+                    let preview = body.chars().take(200).collect::<String>();
+                    warn!(
+                        hitl_id = %id_owned,
+                        status = %status,
+                        body_preview = %preview,
+                        "HITL Discord webhook rejected"
+                    );
+                }
             }
             Err(e) => {
                 warn!(hitl_id = %id_owned, error = %e,
@@ -433,13 +462,347 @@ fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &
 /// host without port, or `None` if the URL is unparseable.
 fn url_host_str(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let host_part = after_scheme.split_once('/').map(|(h, _)| h).unwrap_or(after_scheme);
+    let host_part = after_scheme
+        .split_once('/')
+        .map(|(h, _)| h)
+        .unwrap_or(after_scheme);
     let host = host_part.split(':').next().unwrap_or("");
     if host.is_empty() {
         None
     } else {
         Some(host.trim().trim_start_matches('.').to_ascii_lowercase())
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// HITL self-service solve UI — a tiny HTML form that lets the operator paste
+// cookies from a real browser without needing SSH or curl access. The form
+// POST reuses `handle_hitl_solve` so cookie-jar injection, queue mutation
+// and disk snapshot stay single-source-of-truth.
+// ---------------------------------------------------------------------------------------
+
+/// Minimal HTML entity escaper. We escape `&`, `<`, `>`, `"` and `'` so user
+/// controlled strings (URLs, hostnames, error messages) can't inject markup
+/// into the form. We deliberately avoid pulling in a `markup`/`ammonia`
+/// dependency — this is enough for the controlled contexts we render into.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Parse the cookie textarea into a `Vec<HitlCookie>`. We accept two shapes:
+///
+/// 1. JSON array (`[{...}, ...]`) — re-use the `HitlCookie` deserializer
+///    directly so we get the same behaviour as the JSON solve endpoint.
+/// 2. Raw `document.cookie` paste — semicolon-separated `name=value` pairs,
+///    optionally split across newlines. Whitespace and blank entries are
+///    dropped. If the value contains `=` (e.g. base64 padding), only the
+///    first `=` is the name/value separator; the rest is the value.
+///
+/// Cookies without an explicit `domain` get `None` here; the caller is
+/// expected to backfill from the queue entry's URL via `url_host_str`.
+fn parse_cookies_text(text: &str) -> Result<Vec<HitlCookie>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("cookies field is empty".to_string());
+    }
+    if trimmed.starts_with('[') {
+        // JSON array path — leverage serde's struct deserializer so the
+        // contract stays identical to the JSON solve endpoint.
+        let parsed: Vec<HitlCookie> =
+            serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON cookie array: {e}"))?;
+        if parsed.is_empty() {
+            return Err("JSON cookie array is empty".to_string());
+        }
+        return Ok(parsed);
+    }
+    // Raw `document.cookie` path — split on `;` and newline so a paste
+    // like `a=1; b=2\nc=3` is parsed correctly.
+    let mut out = Vec::new();
+    for raw in trimmed.split([';', '\n']) {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (name, value) = match entry.split_once('=') {
+            Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
+            None => continue, // skip malformed entries silently
+        };
+        if name.is_empty() {
+            continue;
+        }
+        out.push(HitlCookie {
+            name,
+            value,
+            domain: None,
+            max_age_secs: None,
+        });
+    }
+    if out.is_empty() {
+        return Err("no valid name=value cookie pairs found in input".to_string());
+    }
+    Ok(out)
+}
+
+/// Build the URL the operator should be sent to from the server's
+/// bind address. NOTE: when `bind_addr` is `0.0.0.0:3002` (the default
+/// wildcard), the host portion is the wildcard — set `CRW_PUBLIC_URL`
+/// to override (e.g. `http://192.168.1.42:3002`) so the link is
+/// routable from the operator's network.
+#[allow(dead_code)]
+fn solve_ui_url(state: &AppState, hitl_id: &str) -> String {
+    format!(
+        "http://{}/v2/scrape/hitl/{}/solve-ui",
+        state.config.public_base_url(),
+        hitl_id
+    )
+}
+
+/// Tiny HTML chrome — a header + footer pair shared by all solve-ui pages.
+/// We inline the CSS so there's no CDN / external asset dependency.
+fn page_shell(title: &str, body: &str) -> String {
+    let title = html_escape(title);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+:root {{ color-scheme: light dark; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }}
+@media (prefers-color-scheme: dark) {{ body {{ background: #111; color: #e6e6e6; }} a {{ color: #8ab4f8; }} textarea, input {{ background: #1d1d1d; color: #e6e6e6; border: 1px solid #444; }} button {{ background: #2563eb; color: #fff; border: none; }} }}
+h1 {{ font-size: 1.4rem; margin-bottom: 0.25rem; }}
+.url {{ color: #666; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; font-size: 0.9rem; }}
+.banner {{ padding: 0.75rem 1rem; border-radius: 6px; margin: 1rem 0; }}
+.banner.ok {{ background: rgba(34, 197, 94, 0.15); border: 1px solid rgba(34, 197, 94, 0.4); }}
+.banner.warn {{ background: rgba(234, 179, 8, 0.15); border: 1px solid rgba(234, 179, 8, 0.4); }}
+.banner.err {{ background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); }}
+textarea {{ width: 100%; min-height: 160px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9rem; padding: 0.5rem; box-sizing: border-box; border-radius: 4px; }}
+button {{ padding: 0.6rem 1.4rem; border-radius: 4px; font-size: 1rem; cursor: pointer; margin-top: 0.75rem; }}
+a.back {{ display: inline-block; margin-top: 1rem; }}
+details {{ margin-top: 1.5rem; padding: 0.5rem 0.75rem; border: 1px solid #ccc; border-radius: 6px; }}
+summary {{ cursor: pointer; font-weight: 500; }}
+code {{ background: rgba(127,127,127,0.15); padding: 0.1rem 0.3rem; border-radius: 3px; }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"#
+    )
+}
+
+/// Render the GET form for `id`. Pre-fills with the already-solved banner
+/// when the queue entry exists and is in `solved` status (idempotent re-render).
+fn render_solve_ui_form(id: &str, entry: Option<&serde_json::Value>) -> String {
+    let id_esc = html_escape(id);
+    let (host_display, url_display, solved_banner) = match entry {
+        Some(e) => {
+            let url = e.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let host = url_host_str(url).unwrap_or_else(|| url.to_string());
+            let status = e
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending");
+            let solved_at = e.get("solved_at").and_then(|v| v.as_str()).unwrap_or("");
+            let banner = if status == "solved" {
+                format!(
+                    r#"<div class="banner ok">Already solved at <code>{}</code>. Resubmitting will overwrite the stored cookies.</div>"#,
+                    html_escape(solved_at)
+                )
+            } else {
+                String::new()
+            };
+            (host, url.to_string(), banner)
+        }
+        None => ("(unknown host)".to_string(), String::new(), String::new()),
+    };
+    let body = format!(
+        r#"<h1>Solve HITL challenge for {host_display}</h1>
+<div class="url">URL: {url_display}</div>
+<div class="url">HITL id: <code>{id_esc}</code></div>
+{solved_banner}
+<form method="post" action="/v2/scrape/hitl/{id_esc}/solve-ui">
+  <label for="cookies"><strong>Cookies</strong></label><br>
+  <textarea name="cookies" id="cookies" placeholder="Paste your cookies here. You can paste raw document.cookie output (semicolon-separated name=value pairs) OR a JSON array."></textarea><br>
+  <button type="submit">Solve</button>
+</form>
+<details>
+  <summary>How to get these cookies?</summary>
+  <ol>
+    <li>Open the target URL in a normal (non-headless) browser and solve the challenge.</li>
+    <li>Open DevTools (F12 / Cmd+Opt+I) → <strong>Console</strong> tab.</li>
+    <li>Type <code>document.cookie</code> and press Enter. The browser prints <code>name=value; name2=value2; ...</code>.</li>
+    <li>Copy the entire output and paste it into the textarea above.</li>
+    <li>Click <strong>Solve</strong>. The cookies are stored on the server and reused for future scrapes.</li>
+  </ol>
+  <p>If you have a JSON array (e.g. from another scraper), paste that directly — both formats are accepted.</p>
+</details>"#,
+        host_display = html_escape(&host_display),
+        url_display = html_escape(&url_display),
+        id_esc = id_esc,
+        solved_banner = solved_banner,
+    );
+    page_shell("Solve HITL challenge", &body)
+}
+
+fn render_solve_result_success(id: &str, n: usize, host: &str) -> String {
+    let body = format!(
+        r#"<h1>✅ Solved!</h1>
+<div class="banner ok"><strong>{n}</strong> cookie{plural} stored for host <code>{host}</code> (id <code>{id}</code>). You can close this tab and re-run your scrape.</div>
+<a class="back" href="/v2/scrape/hitl/{id}/solve-ui">← Back</a>"#,
+        n = n,
+        plural = if n == 1 { "" } else { "s" },
+        host = html_escape(host),
+        id = html_escape(id),
+    );
+    page_shell("Solved", &body)
+}
+
+fn render_solve_result_error(id: &str, err: &str) -> String {
+    let body = format!(
+        r#"<h1>❌ Solve failed</h1>
+<div class="banner err"><strong>Error:</strong> {err}</div>
+<a class="back" href="/v2/scrape/hitl/{id}/solve-ui">← Back to the form</a>"#,
+        err = html_escape(err),
+        id = html_escape(id),
+    );
+    page_shell("Solve failed", &body)
+}
+
+/// GET /v2/scrape/hitl/:id/solve-ui — render the HTML solve form.
+pub async fn hitl_solve_ui_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let entry = handle_hitl_result(&state, &id).ok();
+    if entry.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"))],
+            format!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Unknown hitl_id</title></head><body style=\"font-family:sans-serif;max-width:600px;margin:3rem auto;padding:0 1rem;\"><h1>Unknown hitl_id</h1><p>No HITL queue entry found for id <code>{}</code>.</p></body></html>",
+                html_escape(&id)
+            ),
+        )
+            .into_response();
+    }
+    let html = render_solve_ui_form(&id, entry.as_ref());
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        html,
+    )
+        .into_response()
+}
+
+/// POST /v2/scrape/hitl/:id/solve-ui — accept the cookie textarea, parse it,
+/// hand it to the same `handle_hitl_solve` core that the JSON endpoint uses,
+/// then render an HTML result page.
+pub async fn hitl_solve_ui_post(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<HitlSolveUiForm>,
+) -> impl IntoResponse {
+    let html_ct = [(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    )];
+    // 1. Parse the textarea (handles both raw document.cookie and JSON array).
+    let cookies = match parse_cookies_text(&form.cookies) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                html_ct.clone(),
+                render_solve_result_error(&id, &e),
+            )
+                .into_response();
+        }
+    };
+    // 2. Backfill any missing domains from the queue entry's URL host so the
+    //    operator doesn't have to know which host each cookie belongs to.
+    let host_for_backfill = handle_hitl_result(&state, &id)
+        .ok()
+        .and_then(|e| e.get("url").and_then(|v| v.as_str()).and_then(url_host_str));
+    let cookies: Vec<HitlCookie> = cookies
+        .into_iter()
+        .map(|mut c| {
+            if c.domain.is_none() {
+                c.domain = host_for_backfill.clone();
+            }
+            c
+        })
+        .collect();
+    // 3. Delegate to the single-source-of-truth core. Map its JSON error
+    //    tuple back to an HTML error page so the operator sees something
+    //    friendly in the browser.
+    let req = HitlSolveRequest { cookies };
+    match handle_hitl_solve(&state, &id, req).await {
+        Ok(value) => {
+            let n = value
+                .get("cookies_stored")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let host = value
+                .get("host")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            info!(hitl_id = %id, host = %host, cookies = n, "HITL solve-ui POST succeeded");
+            (
+                StatusCode::OK,
+                html_ct,
+                render_solve_result_success(&id, n, &host),
+            )
+                .into_response()
+        }
+        Err((status, err_val)) => {
+            let err_msg = err_val
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            warn!(hitl_id = %id, status = %status, error = %err_msg, "HITL solve-ui POST failed");
+            // 404 from the core = unknown id; render the same friendly "unknown"
+            // page the GET handler uses.
+            if status == StatusCode::NOT_FOUND {
+                return (
+                    StatusCode::NOT_FOUND,
+                    html_ct,
+                    format!(
+                        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Unknown hitl_id</title></head><body style=\"font-family:sans-serif;max-width:600px;margin:3rem auto;padding:0 1rem;\"><h1>Unknown hitl_id</h1><p>No HITL queue entry found for id <code>{}</code>.</p></body></html>",
+                        html_escape(&id)
+                    ),
+                )
+                    .into_response();
+            }
+            (status, html_ct, render_solve_result_error(&id, &err_msg)).into_response()
+        }
+    }
+}
+
+/// Form payload for the solve-ui POST. We accept just the `cookies` field;
+/// everything else (host, domain) is resolved server-side.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HitlSolveUiForm {
+    #[serde(default)]
+    pub cookies: String,
 }
 
 pub async fn health() -> impl IntoResponse {
@@ -517,12 +880,7 @@ async fn handle_scrape(
                 // logged as a warning; we never block the scrape response
                 // on the webhook (it's a fire-and-forget tokio task with
                 // a 5s timeout).
-                fire_discord_hitl_webhook(
-                    state,
-                    &hitl_resp.id,
-                    &challenge_kind,
-                    &url,
-                );
+                fire_discord_hitl_webhook(state, &hitl_resp.id, &challenge_kind, &url);
                 let instructions = format!(
                     "anti-bot challenge ({challenge_kind}) not solved automatically; \
                      open the URL in a browser, solve the challenge, then POST the \
@@ -953,13 +1311,12 @@ mod tests {
 
     #[test]
     fn hitl_solve_unknown_id_via_missing_queue_file() {
-        // Use a temp file as the queue path so we can prove the "not found"
-        // branch doesn't panic. We can't override the const HITL_QUEUE_PATH
-        // here, so we accept either: (a) the real file exists and contains
-        // no entry matching our random uuid → 404 path, or (b) the real
-        // file is empty / missing → also 404. Both branches share the same
-        // outer shape (returns Err with NOT_FOUND).
-        let queue_path = std::path::PathBuf::from(HITL_QUEUE_PATH);
+        // Use the resolved queue path so we can prove the "not found" branch
+        // doesn't panic. We accept either: (a) the file exists and contains
+        // no entry matching our random uuid → 404 path, or (b) the file is
+        // empty / missing → also 404. Both branches share the same outer
+        // shape (returns Err with NOT_FOUND).
+        let queue_path = hitl_queue_path();
         // Read the file if it exists; we just want to assert the loop
         // produces no match for a clearly-fake id. This test passes as
         // long as the handler doesn't panic — the actual 404 contract is
@@ -970,5 +1327,130 @@ mod tests {
         // Fake id that will never exist in any queue:
         let fake_id = "00000000-0000-0000-0000-000000000000";
         assert!(!fake_id.is_empty());
+    }
+
+    #[test]
+    fn html_escape_handles_all_five_entities() {
+        // All five entities must be escaped; everything else passes through.
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+        assert_eq!(html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(html_escape("\"hi\""), "&quot;hi&quot;");
+        assert_eq!(html_escape("it's"), "it&#39;s");
+        // Mixed + no-op characters.
+        assert_eq!(
+            html_escape("a<b>c&d\"e'f"),
+            "a&lt;b&gt;c&amp;d&quot;e&#39;f"
+        );
+        // Empty / plain ASCII is unchanged.
+        assert_eq!(html_escape(""), "");
+        assert_eq!(html_escape("hello world"), "hello world");
+        // Already-escaped entities are double-escaped (we don't try to be
+        // clever — the user is responsible for not pre-escaping).
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
+    fn parse_cookies_text_raw_document_cookie() {
+        // The most common case: paste `document.cookie` output verbatim.
+        let text = "cf_clearance=abc123; session=xyz; user_pref=dark";
+        let parsed = parse_cookies_text(text).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, "cf_clearance");
+        assert_eq!(parsed[0].value, "abc123");
+        assert_eq!(parsed[1].name, "session");
+        assert_eq!(parsed[1].value, "xyz");
+        assert_eq!(parsed[2].name, "user_pref");
+        assert_eq!(parsed[2].value, "dark");
+        // Domains are unset — the form handler backfills from the queue URL.
+        assert!(parsed.iter().all(|c| c.domain.is_none()));
+    }
+
+    #[test]
+    fn parse_cookies_text_handles_newlines_and_extra_equals() {
+        // Cookies pasted across lines, with base64 padding in the value.
+        let text = "a=1\nb=2==; c=hello=world";
+        let parsed = parse_cookies_text(text).unwrap();
+        assert_eq!(parsed.len(), 3);
+        // First `=` is the separator; everything after is the value.
+        assert_eq!(parsed[0].name, "a");
+        assert_eq!(parsed[0].value, "1");
+        assert_eq!(parsed[1].name, "b");
+        assert_eq!(parsed[1].value, "2==");
+        assert_eq!(parsed[2].name, "c");
+        assert_eq!(parsed[2].value, "hello=world");
+    }
+
+    #[test]
+    fn parse_cookies_text_json_array_path() {
+        let text = r#"[{"name":"foo","value":"bar","domain":".example.com"}]"#;
+        let parsed = parse_cookies_text(text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "foo");
+        assert_eq!(parsed[0].value, "bar");
+        assert_eq!(parsed[0].domain.as_deref(), Some(".example.com"));
+    }
+
+    #[test]
+    fn parse_cookies_text_rejects_empty_or_malformed() {
+        // Empty input is an error so we don't accidentally POST a no-op solve.
+        assert!(parse_cookies_text("").is_err());
+        assert!(parse_cookies_text("   \n  ").is_err());
+        // Only `=` signs, no names → no valid pairs.
+        assert!(parse_cookies_text("=; =; =").is_err());
+        // Empty JSON array is an error.
+        assert!(parse_cookies_text("[]").is_err());
+    }
+
+    #[test]
+    fn render_solve_ui_form_contains_form_action_and_placeholder() {
+        // Quick smoke check: the rendered HTML contains the form action,
+        // the textarea name, the placeholder text and the title.
+        let html = render_solve_ui_form(
+            "abc-123",
+            Some(&serde_json::json!({
+                "id": "abc-123",
+                "url": "https://example.com/secure",
+                "status": "pending",
+            })),
+        );
+        assert!(html.contains("<form method=\"post\" action=\"/v2/scrape/hitl/abc-123/solve-ui\">"));
+        assert!(html.contains("name=\"cookies\""));
+        assert!(html.contains("Paste your cookies here"));
+        assert!(html.contains("Solve HITL challenge"));
+        // Host extracted from URL.
+        assert!(html.contains("example.com"));
+        // URL is HTML-escaped (slash and colon are not escaped, but if the
+        // URL had `<script>` it would be).
+        assert!(html.contains("https://example.com/secure"));
+    }
+
+    #[test]
+    fn render_solve_ui_form_shows_solved_banner_for_solved_entries() {
+        let html = render_solve_ui_form(
+            "x",
+            Some(&serde_json::json!({
+                "id": "x",
+                "url": "https://x.test/",
+                "status": "solved",
+                "solved_at": "2026-01-02T03:04:05Z",
+            })),
+        );
+        assert!(html.contains("Already solved"));
+        assert!(html.contains("2026-01-02T03:04:05Z"));
+    }
+
+    #[test]
+    fn render_solve_ui_form_escapes_url_and_id() {
+        // Make sure a malicious URL/id cannot break out of the form.
+        let html = render_solve_ui_form(
+            "<script>alert(1)</script>",
+            Some(&serde_json::json!({
+                "id": "<script>alert(1)</script>",
+                "url": "https://evil.test/?x=<script>",
+                "status": "pending",
+            })),
+        );
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 }

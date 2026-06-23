@@ -29,6 +29,12 @@ pub struct Config {
     /// is the Runtipi-managed data path. Empty (`None`) means "do not
     /// persist" — in-memory only.
     pub cookie_persistence_path: Option<String>,
+    /// Public URL used to build operator-facing links (e.g. the Discord
+    /// "solve in browser" link). When `None` (the default), links fall back
+    /// to `bind_addr()` — which is fine if `host` is itself a routable IP,
+    /// but breaks for the `0.0.0.0` wildcard bind. Set in Runtipi via the
+    /// `CRW_PUBLIC_URL` env var (e.g. `http://192.168.1.42:3002`).
+    pub public_url: Option<String>,
 }
 
 impl Default for Config {
@@ -53,6 +59,7 @@ impl Default for Config {
             flaresolverr_url: None,
             discord_webhook_hitl_url: None,
             cookie_persistence_path: Some("/var/lib/crw-shield/cookies.json".to_string()),
+            public_url: None,
         }
     }
 }
@@ -144,12 +151,26 @@ impl Config {
         if let Ok(v) = env::var("COOKIE_PERSISTENCE_PATH") {
             cfg.cookie_persistence_path = if v.is_empty() { None } else { Some(v) };
         }
+        if let Ok(v) = env::var("CRW_PUBLIC_URL") {
+            if !v.is_empty() {
+                cfg.public_url = Some(v);
+            }
+        }
 
         Ok(cfg)
     }
 
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// URL to embed in operator-facing links (Discord "solve in browser",
+    /// log messages, etc.). Prefers `public_url` (operator-configured
+    /// routable URL); falls back to `bind_addr()` if not set — accepting
+    /// that `0.0.0.0` will produce a non-routable URL the operator has to
+    /// substitute.
+    pub fn public_base_url(&self) -> String {
+        self.public_url.clone().unwrap_or_else(|| self.bind_addr())
     }
 }
 
@@ -188,7 +209,10 @@ mod tests {
         std::env::set_var("STEALTH_ENABLED", "false");
         std::env::set_var("SEARXNG_URL", "http://example.com/");
         std::env::set_var("CRAWL_MAX_CONCURRENCY", "10");
-        std::env::set_var("DISCORD_WEBHOOK_HITL_URL", "https://discord.com/api/webhooks/abc");
+        std::env::set_var(
+            "DISCORD_WEBHOOK_HITL_URL",
+            "https://discord.com/api/webhooks/abc",
+        );
         std::env::set_var("COOKIE_PERSISTENCE_PATH", "/tmp/cookies.json");
 
         let cfg = Config::from_env().unwrap();
@@ -201,7 +225,10 @@ mod tests {
             cfg.discord_webhook_hitl_url.as_deref(),
             Some("https://discord.com/api/webhooks/abc")
         );
-        assert_eq!(cfg.cookie_persistence_path.as_deref(), Some("/tmp/cookies.json"));
+        assert_eq!(
+            cfg.cookie_persistence_path.as_deref(),
+            Some("/tmp/cookies.json")
+        );
 
         // Empty COOKIE_PERSISTENCE_PATH means "do not persist".
         std::env::set_var("COOKIE_PERSISTENCE_PATH", "");

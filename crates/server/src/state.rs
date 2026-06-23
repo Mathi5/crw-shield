@@ -33,6 +33,12 @@ pub struct AppState {
     /// `RATE_LIMIT_JITTER_MS`). Set both to 0 to disable. See
     /// `crate::rate_limit::RateLimiter`.
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// Resolved cookie persistence path: the user-configured path if it
+    /// is writable, otherwise the user-local fallback
+    /// (`$XDG_DATA_HOME/crw-shield/cookies.json`), otherwise `None` for
+    /// in-memory only. Handlers should read this rather than
+    /// `config.cookie_persistence_path` so they pick up the fallback.
+    pub cookie_persistence_path: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -119,15 +125,14 @@ impl AppState {
         // — we just re-seed it from the saved file. A load failure is logged
         // and ignored; the jar starts empty and the next scrape will collect
         // whatever the upstream site sends back.
-        Self::seed_cookie_jar(&ladder, config.cookie_persistence_path.as_deref());
+        let cookie_path =
+            Self::resolve_cookie_persistence_path(config.cookie_persistence_path.as_deref());
+        Self::seed_cookie_jar(&ladder, cookie_path.as_deref());
         // Spawn a background task that snapshots the cookie jar to disk
         // every 60s. Lets cf_clearance / session cookies survive a
         // container restart. Skipped when no persistence path is set
         // (in-memory only mode).
-        Self::spawn_cookie_persistence_loop(
-            ladder.cookies(),
-            config.cookie_persistence_path.clone(),
-        );
+        Self::spawn_cookie_persistence_loop(ladder.cookies(), cookie_path.clone());
         Self {
             config: Arc::new(config),
             ladder,
@@ -136,20 +141,110 @@ impl AppState {
             host_counters: Arc::new(Mutex::new(HashMap::new())),
             tls_proxy,
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_env()),
+            cookie_persistence_path: cookie_path,
         }
+    }
+
+    /// Decide where the cookie jar should actually live on disk.
+    ///
+    /// Order of preference:
+    /// 1. `configured_path` (from `COOKIE_PERSISTENCE_PATH` env var or default
+    ///    `/var/lib/crw-shield/cookies.json`). If we can create the parent
+    ///    dir + write a tiny probe file, use it.
+    /// 2. A user-local fallback: `$XDG_DATA_HOME/crw-shield/cookies.json` or
+    ///    `~/.local/share/crw-shield/cookies.json`. Covers local dev / smoke
+    ///    tests where the process is unprivileged and can't write to
+    ///    `/var/lib/...`.
+    /// 3. `None` — in-memory only, no persistence. Last resort if even the
+    ///    user-local dir is unwritable (very unusual).
+    ///
+    /// `configured_path = None` short-circuits to `None` immediately, so
+    /// `COOKIE_PERSISTENCE_PATH=""` still disables persistence as before.
+    fn resolve_cookie_persistence_path(
+        configured_path: Option<&str>,
+    ) -> Option<std::path::PathBuf> {
+        let Some(p) = configured_path else {
+            tracing::info!("cookie persistence disabled (no COOKIE_PERSISTENCE_PATH)");
+            return None;
+        };
+        let path = std::path::PathBuf::from(p);
+        if Self::probe_writable(&path) {
+            return Some(path);
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "configured cookie persistence path is not writable; falling back to user-local dir"
+        );
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(Self::dirs_home_fallback);
+        let Some(home) = home else {
+            tracing::warn!("no HOME directory available; cookie persistence disabled");
+            return None;
+        };
+        let xdg = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("share"));
+        let fallback = xdg.join("crw-shield").join("cookies.json");
+        if Self::probe_writable(&fallback) {
+            tracing::warn!(
+                path = %fallback.display(),
+                "cookie persistence moved to user-local fallback"
+            );
+            return Some(fallback);
+        }
+        tracing::warn!(
+            path = %fallback.display(),
+            "user-local fallback also not writable; cookie persistence disabled (in-memory only)"
+        );
+        None
+    }
+
+    /// Test whether we can create the parent dir of `path` and write a
+    /// small probe file inside it. Returns false on any error so the
+    /// caller can fall back without surfacing confusing I/O errors later.
+    fn probe_writable(path: &std::path::Path) -> bool {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::debug!(path = %parent.display(), error = %e,
+                    "probe_writable: create_dir_all failed");
+                return false;
+            }
+        }
+        // Write a tiny probe file with a unique name. We don't try to clean it
+        // up — it's in the target dir, ephemeral, and harmless.
+        let probe = parent.join(format!(".write-probe-{}", std::process::id()));
+        match std::fs::write(&probe, b"probe") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(e) => {
+                tracing::debug!(path = %probe.display(), error = %e,
+                    "probe_writable: write failed");
+                false
+            }
+        }
+    }
+
+    /// Last-ditch HOME lookup for environments where $HOME isn't set (e.g. some
+    /// container init systems, systemd services without User=). Uses getpwuid_r
+    /// via `users` crate if available — but to avoid adding a dep we just
+    /// return None and let the caller fall back to in-memory mode.
+    fn dirs_home_fallback() -> Option<std::path::PathBuf> {
+        None
     }
 
     /// Re-seed the shared cookie jar from a JSON file (if any). Missing
     /// file = empty jar (first boot), corrupt file = warning + empty jar.
-    fn seed_cookie_jar(
-        ladder: &Arc<FetchLadder>,
-        path: Option<&str>,
-    ) {
-        let Some(path_str) = path else {
+    fn seed_cookie_jar(ladder: &Arc<FetchLadder>, path: Option<&std::path::Path>) {
+        let Some(path) = path else {
             tracing::info!("cookie persistence disabled (no COOKIE_PERSISTENCE_PATH)");
             return;
         };
-        let path = std::path::Path::new(path_str);
         match crw_antibot::CookieJar::load_from_path(path) {
             Ok(loaded) => {
                 let count = loaded.iter().len();
@@ -197,12 +292,11 @@ impl AppState {
     /// (the task holds only `Arc`s and an owned `PathBuf`).
     fn spawn_cookie_persistence_loop(
         jar: Arc<crw_antibot::CookieJar>,
-        path: Option<String>,
+        path: Option<std::path::PathBuf>,
     ) {
-        let Some(path_str) = path else {
+        let Some(path) = path else {
             return;
         };
-        let path = std::path::PathBuf::from(path_str);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             // First tick fires immediately; skip it (we just loaded, nothing
@@ -265,7 +359,9 @@ impl AppState {
         );
         // Sync path: we cannot `await` the tokio background save loop here,
         // but seeding the jar from disk is synchronous and works in tests.
-        Self::seed_cookie_jar(&ladder, config.cookie_persistence_path.as_deref());
+        let cookie_path =
+            Self::resolve_cookie_persistence_path(config.cookie_persistence_path.as_deref());
+        Self::seed_cookie_jar(&ladder, cookie_path.as_deref());
         Self {
             config: Arc::new(config),
             ladder,
@@ -274,6 +370,7 @@ impl AppState {
             host_counters: Arc::new(Mutex::new(HashMap::new())),
             tls_proxy: None,
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_env()),
+            cookie_persistence_path: cookie_path,
         }
     }
 }
