@@ -302,7 +302,7 @@ async fn handle_hitl_solve(
             // Snapshot the jar to disk RIGHT NOW (don't wait 60s for the
             // background loop) so a server restart immediately after
             // `solve` doesn't lose the cookies.
-            if let Some(path) = state.config.cookie_persistence_path.as_deref() {
+            if let Some(path) = state.cookie_persistence_path.as_deref() {
                 let p = std::path::Path::new(path);
                 if let Err(e) = shared_jar.save_to_path(p) {
                     warn!(path = %p.display(), error = %e,
@@ -388,7 +388,7 @@ fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &
     let id_owned = hitl_id.to_string();
     let kind_owned = kind.to_string();
     let url_owned = url.to_string();
-    let bind = state.config.bind_addr();
+    let bind = state.config.public_base_url();
     let solve_ui_link = format!("http://{bind}/v2/scrape/hitl/{hitl_id}/solve-ui");
     tokio::spawn(async move {
         let payload = json!({
@@ -426,15 +426,28 @@ fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &
             }
         };
         match client.post(&webhook_url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(hitl_id = %id_owned, "HITL Discord webhook delivered");
-            }
             Ok(resp) => {
-                warn!(
-                    hitl_id = %id_owned,
-                    status = %resp.status(),
-                    "HITL Discord webhook returned non-2xx"
-                );
+                let status = resp.status();
+                // Discord webhook responses with a non-204 status still carry a
+                // JSON error body (e.g. `{"message":"Invalid Webhook Token",
+                // "code":50027}` with HTTP 400). Read the body before deciding
+                // success vs. failure so we don't silently swallow rejections.
+                let body = resp.text().await.unwrap_or_default();
+                if status.is_success() && body.trim().is_empty() {
+                    info!(
+                        hitl_id = %id_owned,
+                        status = %status,
+                        "HITL Discord webhook delivered"
+                    );
+                } else {
+                    let preview = body.chars().take(200).collect::<String>();
+                    warn!(
+                        hitl_id = %id_owned,
+                        status = %status,
+                        body_preview = %preview,
+                        "HITL Discord webhook rejected"
+                    );
+                }
             }
             Err(e) => {
                 warn!(hitl_id = %id_owned, error = %e,
@@ -541,15 +554,16 @@ fn parse_cookies_text(text: &str) -> Result<Vec<HitlCookie>, String> {
     Ok(out)
 }
 
-/// Build the URL the operator should be sent to from the server's bind
-/// address. NOTE: when `bind_addr` is `0.0.0.0:3002` (the default wildcard),
-/// the host portion is the wildcard — the user will need to substitute their
-/// own LAN/hostname to actually reach the server.
+/// Build the URL the operator should be sent to from the server's
+/// bind address. NOTE: when `bind_addr` is `0.0.0.0:3002` (the default
+/// wildcard), the host portion is the wildcard — set `CRW_PUBLIC_URL`
+/// to override (e.g. `http://192.168.1.42:3002`) so the link is
+/// routable from the operator's network.
 #[allow(dead_code)]
 fn solve_ui_url(state: &AppState, hitl_id: &str) -> String {
     format!(
         "http://{}/v2/scrape/hitl/{}/solve-ui",
-        state.config.bind_addr(),
+        state.config.public_base_url(),
         hitl_id
     )
 }
