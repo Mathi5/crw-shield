@@ -145,6 +145,24 @@ pub struct ScrapeRequest {
 
     #[serde(default = "true_default")]
     pub store_in_cache: bool,
+
+    /// Skip JavaScript rendering. When `true` (default), the scraper
+    /// performs a plain HTTP fetch and returns the server-rendered HTML
+    /// directly. When `false`, the request is escalated to the CDP
+    /// (headless Chromium) fetcher regardless of whether `actions` are
+    /// present, so single-page apps (YouTube `/watch`, SPAs with
+    /// client-side routing, etc.) get a chance to render before
+    /// extraction.
+    ///
+    /// Note: this is the inverse of the Firecrawl v2 `skipJs` field.
+    /// Firecrawl uses `skipJs=false` to mean "render with JS" — we follow
+    /// the same convention.
+    ///
+    /// Default `true` (no JS) preserves the previous fast-path behaviour:
+    /// most static sites don't need a browser, and CDP cold-start is
+    /// 3-4 seconds per request.
+    #[serde(default = "true_default")]
+    pub skip_js: bool,
 }
 
 impl ScrapeRequest {
@@ -166,6 +184,7 @@ impl ScrapeRequest {
             proxy: ProxyMode::Auto,
             max_age: default_max_age(),
             store_in_cache: true,
+            skip_js: true,
         }
     }
 }

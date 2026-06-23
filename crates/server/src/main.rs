@@ -6,11 +6,21 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The chromiumoxide driver emits a cosmetic CDP warning on every fetch:
+    //   "WS Invalid message: data did not match any variant of untagged enum
+    //    Message"
+    // (Chrome 120+ sends CDP events that the chromiumoxide_cdp parser
+    // doesn't recognise. Harmless but floods the logs.) We silence both
+    // crate targets unconditionally — this filter must NOT be overridable
+    // via RUST_LOG, otherwise users who set `RUST_LOG=info` (e.g. our
+    // docker-compose) will re-enable the noise. We do honour user RUST_LOG
+    // for every OTHER target.
+    let user_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let combined = user_filter
+        .add_directive("chromiumoxide=off".parse().expect("valid directive"))
+        .add_directive("chromiumoxide_cdp=off".parse().expect("valid directive"));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,chromiumoxide=off,chromiumoxide_cdp=off")),
-        )
+        .with_env_filter(combined)
         .with_target(false)
         .init();
 

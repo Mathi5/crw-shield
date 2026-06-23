@@ -172,6 +172,15 @@ impl FetchLadder {
 
     /// Heuristic: should we skip HTTP and go straight to CDP?
     fn needs_cdp(request: &ScrapeRequest) -> bool {
+        // `skip_js: false` is the explicit opt-in for JS rendering
+        // (Firecrawl v2 convention). When set, escalate to CDP even if
+        // no actions are present and no screenshot is requested — this
+        // is the path for single-page apps (YouTube `/watch`, SPAs
+        // with client-side routing) whose server-rendered HTML is just
+        // a JS shell with no useful content.
+        if !request.skip_js {
+            return true;
+        }
         if !request.actions.is_empty() {
             // Any browser-only action (click, write, screenshot, scroll, ...)
             // forces CDP. We allow `wait` and `executeJavascript` to run on
@@ -1520,5 +1529,55 @@ Definitely not a bot block page.</p>
             res.is_err(),
             "expected Err for short DataDome page (<1k chars), got Ok: {res:?}"
         );
+    }
+
+    // -- skip_js wiring (v0.4.1) ------------------------------------------
+    //
+    // `needs_cdp()` is the single source of truth for whether a request
+    // should escalate from HTTP to headless Chromium. The default
+    // `skip_js: true` keeps the previous fast path (HTTP-only); the
+    // opt-in `skip_js: false` is what enables SPA / YouTube / etc.
+
+    fn req_with_skip_js(skip_js: bool) -> ScrapeRequest {
+        let mut r = ScrapeRequest::default_for_url("https://example.com");
+        r.skip_js = skip_js;
+        r
+    }
+
+    #[test]
+    fn needs_cdp_defaults_to_false_when_skip_js_is_true() {
+        // skip_js defaults to true → no escalation (matches v0.4.0
+        // behaviour, no regression for fast HTTP scrapes).
+        let req = req_with_skip_js(true);
+        assert!(!FetchLadder::needs_cdp(&req));
+    }
+
+    #[test]
+    fn needs_cdp_returns_true_when_skip_js_is_false() {
+        // skip_js: false is the Firecrawl v2 opt-in for JS rendering.
+        // Even with no actions and no screenshot, the request must
+        // escalate to CDP — otherwise YouTube / SPA scrapes return the
+        // empty JS shell (see v0.4.0 bug 3 report).
+        let req = req_with_skip_js(false);
+        assert!(FetchLadder::needs_cdp(&req));
+    }
+
+    #[test]
+    fn needs_cdp_still_escalates_on_actions_when_skip_js_true() {
+        // Pre-existing behaviour: `actions` force CDP even with the
+        // default skip_js=true. We don't want to regress that.
+        let mut req = req_with_skip_js(true);
+        req.actions
+            .push(crw_core::BrowserAction::Wait { milliseconds: 500 });
+        assert!(FetchLadder::needs_cdp(&req));
+    }
+
+    #[test]
+    fn needs_cdp_still_escalates_on_screenshot_when_skip_js_true() {
+        // Screenshot format cannot be served by HTTP alone — must
+        // escalate regardless of skip_js value.
+        let mut req = req_with_skip_js(true);
+        req.formats = vec![Format::Screenshot];
+        assert!(FetchLadder::needs_cdp(&req));
     }
 }
