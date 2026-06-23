@@ -38,8 +38,12 @@ table and `bench/A_B_30SITE_BENCH.md` for the A/B comparison against
 - **Adaptive ladder** — HTTP → CDP → FlareSolverr, with rotation between
   5 browser profiles
 - **HITL (Human-in-the-Loop) queue** — if the ladder exhausts, the request is
-  enqueued for manual resolution and the cookies can be retrieved via
-  `GET /v2/scrape/hitl/result?id=<uuid>`
+  enqueued for manual resolution. Solve the challenge in a visible browser,
+  then `POST /v2/scrape/hitl/:id/solve` with the resulting cookies — they
+  get injected into the shared `CookieJar`, persisted to disk
+  (`/var/lib/crw-shield/cookies.json` by default), and reused automatically
+  on every subsequent scrape of that host. Set `DISCORD_WEBHOOK_HITL_URL`
+  to get pinged with the challenge details + a ready-to-paste curl command.
 - **Residential-IP friendly** — works with cheap or free residential proxies
   because the browser profile, TLS fingerprint, and HTTP/2 SETTINGS are
   consistent with a real browser

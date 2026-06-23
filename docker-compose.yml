@@ -62,6 +62,17 @@ services:
       # wait on 9-site sequential panels.
       - RATE_LIMIT_MIN_MS=0
       - RATE_LIMIT_JITTER_MS=0
+      # HITL cookie persistence + Discord notification. The cookie jar is
+      # reloaded from this file at startup and snapshotted back every 60s,
+      # so `cf_clearance` and other solved-challenge cookies survive a
+      # container restart. Empty value = in-memory only (no persistence).
+      - COOKIE_PERSISTENCE_PATH=/var/lib/crw-shield/cookies.json
+      # Set this to a Discord webhook URL (Server Settings → Integrations →
+      # Webhooks → New webhook → Copy URL) and the server will ping the
+      # channel every time a HITL challenge is auto-enqueued, with the
+      # challenge kind, URL, id, and a ready-to-paste curl solve command.
+      # Empty = no notifications.
+      # - DISCORD_WEBHOOK_HITL_URL=
     volumes:
       # Persistent CA dir for the TLS-impersonate-proxy (so the CA survives
       # container restarts). Comment out the TLS_PROXY_* env vars above
