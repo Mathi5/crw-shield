@@ -361,8 +361,17 @@ async fn handle_hitl_solve(
 /// tokio task with a 5-second timeout. Failures are logged as warnings.
 fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &str) {
     let Some(webhook_url) = state.config.discord_webhook_hitl_url.clone() else {
+        warn!(
+            hitl_id = %hitl_id,
+            "HITL webhook skipped: DISCORD_WEBHOOK_HITL_URL not configured"
+        );
         return;
     };
+    info!(
+        hitl_id = %hitl_id,
+        webhook_host = %webhook_url.split("://").nth(1).unwrap_or("?").split('/').next().unwrap_or("?"),
+        "HITL webhook firing"
+    );
     let id_owned = hitl_id.to_string();
     let kind_owned = kind.to_string();
     let url_owned = url.to_string();
