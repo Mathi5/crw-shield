@@ -188,7 +188,10 @@ mod tests {
         std::env::set_var("STEALTH_ENABLED", "false");
         std::env::set_var("SEARXNG_URL", "http://example.com/");
         std::env::set_var("CRAWL_MAX_CONCURRENCY", "10");
-        std::env::set_var("DISCORD_WEBHOOK_HITL_URL", "https://discord.com/api/webhooks/abc");
+        std::env::set_var(
+            "DISCORD_WEBHOOK_HITL_URL",
+            "https://discord.com/api/webhooks/abc",
+        );
         std::env::set_var("COOKIE_PERSISTENCE_PATH", "/tmp/cookies.json");
 
         let cfg = Config::from_env().unwrap();
@@ -201,7 +204,10 @@ mod tests {
             cfg.discord_webhook_hitl_url.as_deref(),
             Some("https://discord.com/api/webhooks/abc")
         );
-        assert_eq!(cfg.cookie_persistence_path.as_deref(), Some("/tmp/cookies.json"));
+        assert_eq!(
+            cfg.cookie_persistence_path.as_deref(),
+            Some("/tmp/cookies.json")
+        );
 
         // Empty COOKIE_PERSISTENCE_PATH means "do not persist".
         std::env::set_var("COOKIE_PERSISTENCE_PATH", "");

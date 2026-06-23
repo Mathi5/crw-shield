@@ -141,10 +141,7 @@ impl AppState {
 
     /// Re-seed the shared cookie jar from a JSON file (if any). Missing
     /// file = empty jar (first boot), corrupt file = warning + empty jar.
-    fn seed_cookie_jar(
-        ladder: &Arc<FetchLadder>,
-        path: Option<&str>,
-    ) {
+    fn seed_cookie_jar(ladder: &Arc<FetchLadder>, path: Option<&str>) {
         let Some(path_str) = path else {
             tracing::info!("cookie persistence disabled (no COOKIE_PERSISTENCE_PATH)");
             return;
@@ -195,10 +192,7 @@ impl AppState {
     /// Spawn a tokio task that periodically saves the cookie jar to disk
     /// so the next restart can pick it up. Cancelled on server shutdown
     /// (the task holds only `Arc`s and an owned `PathBuf`).
-    fn spawn_cookie_persistence_loop(
-        jar: Arc<crw_antibot::CookieJar>,
-        path: Option<String>,
-    ) {
+    fn spawn_cookie_persistence_loop(jar: Arc<crw_antibot::CookieJar>, path: Option<String>) {
         let Some(path_str) = path else {
             return;
         };

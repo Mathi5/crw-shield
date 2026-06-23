@@ -265,9 +265,7 @@ impl CookieJar {
     ///
     /// Used by `crates/server/src/state.rs` to seed the in-memory jar from the
     /// on-disk file at startup, and by the tests below.
-    pub fn iter(
-        &self,
-    ) -> Vec<(String, String, String, Option<u64>)> {
+    pub fn iter(&self) -> Vec<(String, String, String, Option<u64>)> {
         let guard = self.inner.lock().expect("cookie jar mutex poisoned");
         let mut out = Vec::new();
         for (host, bucket) in guard.cookies.iter() {
@@ -327,8 +325,9 @@ impl CookieJar {
         // otherwise fail at the rename step.
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| CookieJarError(format!("create_dir_all {}: {e}", parent.display())))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    CookieJarError(format!("create_dir_all {}: {e}", parent.display()))
+                })?;
             }
         }
 
@@ -375,9 +374,8 @@ impl CookieJar {
             cookies: HashMap<String, HashMap<String, Entry>>,
         }
 
-        let parsed: OnDiskJar = serde_json::from_slice(&bytes).map_err(|e| {
-            CookieJarError(format!("parse {}: {e}", path.display()))
-        })?;
+        let parsed: OnDiskJar = serde_json::from_slice(&bytes)
+            .map_err(|e| CookieJarError(format!("parse {}: {e}", path.display())))?;
 
         let now = unix_now();
         let mut cookies: HashMap<String, HashMap<String, Entry>> = HashMap::new();

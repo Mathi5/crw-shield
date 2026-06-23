@@ -284,12 +284,7 @@ async fn handle_hitl_solve(
             let shared_jar = state.ladder.cookies();
             for c in &req.cookies {
                 let cookie_host = c.domain.clone().unwrap_or_else(|| resolved_host.clone());
-                shared_jar.set_cookie(
-                    &cookie_host,
-                    &c.name,
-                    &c.value,
-                    c.max_age_secs,
-                );
+                shared_jar.set_cookie(&cookie_host, &c.name, &c.value, c.max_age_secs);
             }
             // Snapshot the jar to disk RIGHT NOW (don't wait 60s for the
             // background loop) so a server restart immediately after
@@ -308,14 +303,8 @@ async fn handle_hitl_solve(
             let mut new_entry = entry.clone();
             if let Some(obj) = new_entry.as_object_mut() {
                 obj.insert("status".to_string(), json!("solved"));
-                obj.insert(
-                    "solved_at".to_string(),
-                    json!(Utc::now().to_rfc3339()),
-                );
-                obj.insert(
-                    "cookies_stored".to_string(),
-                    json!(req.cookies.len()),
-                );
+                obj.insert("solved_at".to_string(), json!(Utc::now().to_rfc3339()));
+                obj.insert("cookies_stored".to_string(), json!(req.cookies.len()));
                 obj.insert("host".to_string(), json!(resolved_host));
             }
             updated_entry = Some(new_entry.clone());
@@ -433,7 +422,10 @@ fn fire_discord_hitl_webhook(state: &AppState, hitl_id: &str, kind: &str, url: &
 /// host without port, or `None` if the URL is unparseable.
 fn url_host_str(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let host_part = after_scheme.split_once('/').map(|(h, _)| h).unwrap_or(after_scheme);
+    let host_part = after_scheme
+        .split_once('/')
+        .map(|(h, _)| h)
+        .unwrap_or(after_scheme);
     let host = host_part.split(':').next().unwrap_or("");
     if host.is_empty() {
         None
@@ -517,12 +509,7 @@ async fn handle_scrape(
                 // logged as a warning; we never block the scrape response
                 // on the webhook (it's a fire-and-forget tokio task with
                 // a 5s timeout).
-                fire_discord_hitl_webhook(
-                    state,
-                    &hitl_resp.id,
-                    &challenge_kind,
-                    &url,
-                );
+                fire_discord_hitl_webhook(state, &hitl_resp.id, &challenge_kind, &url);
                 let instructions = format!(
                     "anti-bot challenge ({challenge_kind}) not solved automatically; \
                      open the URL in a browser, solve the challenge, then POST the \
