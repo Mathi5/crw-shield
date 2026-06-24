@@ -321,7 +321,9 @@ impl CdpFetcher {
                         // We DO spawn a no-op task to drain the handler
                         // stream — the same pattern as Browser::launch.
                         let handle =
-                            tokio::spawn(async move { while let Some(_msg) = handler.next().await {} });
+                            tokio::spawn(
+                                async move { while let Some(_msg) = handler.next().await {} },
+                            );
                         slot.inner = Some(Inner {
                             browser,
                             _handler: Arc::new(handle),
@@ -438,9 +440,7 @@ impl CdpFetcher {
         // Try to parse as a URL. If the path is "/" or empty, do the
         // discovery round-trip via HTTP /json/version.
         let parsed = url::Url::parse(raw).map_err(|e| format!("invalid URL: {e}"))?;
-        let has_devtools_path = parsed
-            .path()
-            .contains("/devtools/browser/")
+        let has_devtools_path = parsed.path().contains("/devtools/browser/")
             || parsed.path().contains("/devtools/page/");
         if has_devtools_path {
             return Ok(raw.to_string());
@@ -457,7 +457,8 @@ impl CdpFetcher {
                 ));
             }
         };
-        http.set_scheme(scheme).map_err(|_| "failed to swap scheme")?;
+        http.set_scheme(scheme)
+            .map_err(|_| "failed to swap scheme")?;
         http.set_path("/json/version");
         http.set_query(None);
 
@@ -483,9 +484,7 @@ impl CdpFetcher {
         let ws_url = body
             .get("webSocketDebuggerUrl")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                format!("GET {http} response missing `webSocketDebuggerUrl` field")
-            })?;
+            .ok_or_else(|| format!("GET {http} response missing `webSocketDebuggerUrl` field"))?;
         Ok(ws_url.to_string())
     }
 
