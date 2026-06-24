@@ -19,6 +19,7 @@ use chromiumoxide::Page;
 use crw_antibot::{stealth_script, CookieJar};
 use crw_core::{BrowserAction, CrwError, Result, ScrapeRequest};
 use futures::StreamExt;
+use serde_json;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -65,6 +66,17 @@ pub struct CdpConfig {
     /// `None` = no proxy (default). Set via `TLS_PROXY_ENABLED=true`
     /// + the other `TLS_PROXY_*` env vars read by `TlsProxyConfig::from_env`.
     pub tls_proxy: Option<crate::tls_proxy::TlsProxyConfig>,
+    /// If `Some`, the CDP fetcher will connect to an existing Chrome
+    /// browser exposed over the Chrome DevTools Protocol (WebSocket)
+    /// instead of launching a new Chromium process. This lets operators
+    /// reuse a pre-installed Chrome instance (e.g. a `chrome-mcp-bridge`
+    /// sidecar, a Playwright remote endpoint, or a developer-mode Chrome
+    /// with `--remote-debugging-port=9222`) instead of pulling Chromium
+    /// into the crw-shield container. **Mutually exclusive** with
+    /// `chrome_path` / `user_data_dir` — when set, those are ignored.
+    /// `None` = launch a new local Chromium (default).
+    /// Set via `CRW_CDP_REMOTE_URL` env var.
+    pub remote_ws_url: Option<String>,
 }
 
 impl Default for CdpConfig {
@@ -88,6 +100,13 @@ impl Default for CdpConfig {
             launch_timeout: Duration::from_secs(60),
             enable_stealth: true,
             tls_proxy: crate::tls_proxy::TlsProxyConfig::from_env(),
+            // CRW_CDP_REMOTE_URL lets operators point the CDP fetcher at a
+            // pre-existing Chrome instance (chrome-mcp-bridge sidecar,
+            // Playwright remote, or a Chrome with --remote-debugging-port).
+            // When set, we skip launching a new Chromium entirely.
+            remote_ws_url: std::env::var("CRW_CDP_REMOTE_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -265,6 +284,73 @@ impl CdpFetcher {
             slot.last_init_failure = None;
         }
         let cfg = self.build_browser_config()?;
+        // Bug-fix v0.4.4: when CRW_CDP_REMOTE_URL is set, skip the local
+        // Chromium launch entirely and connect to the remote Chrome
+        // instance over CDP WebSocket. The warmup / SingletonLock
+        // / chrome-executable dance is moot — the remote browser is
+        // already running and owned by some other process (chrome-mcp-
+        // bridge sidecar, Playwright remote, dev-mode Chrome with
+        // --remote-debugging-port=...). We retry connect up to 2 times
+        // with a 2 s backoff, same policy as the local launch path.
+        if let Some(ws_url_raw) = self.config.remote_ws_url.as_ref() {
+            // Resolve the WS URL: if the user passed only the host:port
+            // (no path), fetch `http://...:port/json/version` to retrieve
+            // the full `webSocketDebuggerUrl`. Chrome assigns a fresh
+            // browser UUID at every restart, so hard-coding the path is
+            // brittle. If the URL already has a path, pass through.
+            let resolved = match Self::resolve_cdp_ws_url(ws_url_raw).await {
+                Ok(u) => u,
+                Err(e) => {
+                    return Err(CrwError::Fetch(format!(
+                        "failed to resolve CDP remote URL {ws_url_raw}: {e}"
+                    )));
+                }
+            };
+            const MAX_ATTEMPTS: u32 = 2;
+            let mut last_err: Option<CrwError> = None;
+            for attempt in 1..=MAX_ATTEMPTS {
+                match Browser::connect(&resolved).await {
+                    Ok((browser, mut handler)) => {
+                        info!(
+                            ws_url = %resolved,
+                            "CDP fetcher connected to remote Chrome via CRW_CDP_REMOTE_URL"
+                        );
+                        // Note: with a remote browser we intentionally skip the
+                        // profile warmup — the remote Chrome owns its profile
+                        // dir and we cannot (and should not) write to it.
+                        // We DO spawn a no-op task to drain the handler
+                        // stream — the same pattern as Browser::launch.
+                        let handle =
+                            tokio::spawn(async move { while let Some(_msg) = handler.next().await {} });
+                        slot.inner = Some(Inner {
+                            browser,
+                            _handler: Arc::new(handle),
+                        });
+                        return Ok(&mut slot.inner.as_mut().unwrap().browser);
+                    }
+                    Err(e) => {
+                        let crw_err = CrwError::Fetch(format!(
+                            "CDP remote connect to {resolved} failed: {e}"
+                        ));
+                        warn!(
+                            attempt,
+                            max_attempts = MAX_ATTEMPTS,
+                            ws_url = %resolved,
+                            error = %e,
+                            "Browser::connect to remote Chrome failed"
+                        );
+                        last_err = Some(crw_err);
+                        if attempt < MAX_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+            slot.last_init_failure = Some(std::time::Instant::now());
+            return Err(last_err.unwrap_or_else(|| {
+                CrwError::Fetch("CDP remote connect failed (unknown reason)".to_string())
+            }));
+        }
         const MAX_ATTEMPTS: u32 = 2;
         let mut last_err: Option<CrwError> = None;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -332,6 +418,75 @@ impl CdpFetcher {
         Err(last_err.unwrap_or_else(|| {
             CrwError::Fetch("browser initialisation failed (unknown reason)".to_string())
         }))
+    }
+
+    /// Resolve a user-supplied CDP endpoint to a full WebSocket URL.
+    ///
+    /// Two input shapes are accepted:
+    ///
+    /// 1. **Bare host:port** (`ws://localhost:9223`, `http://chrome-mcp:9223`,
+    ///    etc.) — fetch the `GET /json/version` document from the same
+    ///    endpoint, parse out the `webSocketDebuggerUrl` field. This is the
+    ///    common case when reusing a sidecar (Chrome assigns a fresh browser
+    ///    UUID on every restart, so hard-coding the path would break after
+    ///    the first container restart).
+    /// 2. **Full WS URL with path** (`ws://localhost:9223/devtools/browser/<uuid>`)
+    ///    — pass through unchanged.
+    ///
+    /// Returns the resolved WebSocket URL suitable for `Browser::connect`.
+    async fn resolve_cdp_ws_url(raw: &str) -> std::result::Result<String, String> {
+        // Try to parse as a URL. If the path is "/" or empty, do the
+        // discovery round-trip via HTTP /json/version.
+        let parsed = url::Url::parse(raw).map_err(|e| format!("invalid URL: {e}"))?;
+        let has_devtools_path = parsed
+            .path()
+            .contains("/devtools/browser/")
+            || parsed.path().contains("/devtools/page/");
+        if has_devtools_path {
+            return Ok(raw.to_string());
+        }
+        // Build the HTTP equivalent: ws://host:port/... -> http://host:port/json/version
+        let mut http = parsed.clone();
+        let scheme = match parsed.scheme() {
+            "ws" => "http",
+            "wss" => "https",
+            "http" | "https" => parsed.scheme(),
+            other => {
+                return Err(format!(
+                    "unsupported scheme {other} — expected ws://, wss://, http://, or https://"
+                ));
+            }
+        };
+        http.set_scheme(scheme).map_err(|_| "failed to swap scheme")?;
+        http.set_path("/json/version");
+        http.set_query(None);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        let resp = client
+            .get(http.as_str())
+            .send()
+            .await
+            .map_err(|e| format!("GET {http}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "GET {http} returned {} — is this a real Chrome DevTools endpoint?",
+                resp.status()
+            ));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse {http} response: {e}"))?;
+        let ws_url = body
+            .get("webSocketDebuggerUrl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                format!("GET {http} response missing `webSocketDebuggerUrl` field")
+            })?;
+        Ok(ws_url.to_string())
     }
 
     /// Warm up a fresh persistent profile so it looks "lived-in" to anti-bot
