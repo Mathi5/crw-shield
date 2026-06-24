@@ -230,17 +230,19 @@ mod tests {
     }
 
     #[test]
-    fn pick_emulation_returns_chrome131_for_windows_chrome() {
-        // The Windows Chrome profile (UA "Chrome/131.0.0.0") should map
-        // to the Chrome 131 fingerprint regardless of OS string.
+    fn pick_emulation_returns_chrome137_for_windows_chrome() {
+        // Bug-fix v0.4.3: Chrome-Windows (UA "Chrome/131.0.0.0") now maps
+        // to Chrome137 emulation — the newest available in wreq-util
+        // 2.2.6 and closest match to Chrome 149 used by the MCP bridge.
+        // See also: chrome_profile_default_is_chrome137_not_chrome131.
         let profile = BROWSER_PROFILES
             .iter()
             .find(|p| p.name == "Chrome-Windows")
             .expect("Chrome-Windows profile missing from static table");
         assert_eq!(
-            pick_emulation_for_profile(profile),
-            Emulation::Chrome131,
-            "Chrome-Windows profile should pick Chrome 131 emulation"
+            format!("{:?}", pick_emulation_for_profile(profile)),
+            format!("{:?}", Emulation::Chrome137),
+            "Chrome-Windows profile should pick Chrome 137 emulation post-v0.4.3"
         );
     }
 
@@ -273,8 +275,8 @@ mod tests {
     #[test]
     fn pick_emulation_handles_unknown_profile_gracefully() {
         // A bogus profile (e.g. something we'd never build) should still
-        // produce a valid emulation — Chrome 131 is the safe default since
-        // most sites see far more Chrome than anything else.
+        // produce a valid emulation — Chrome 137 is the safe default
+        // since most sites see far more Chrome than anything else.
         let profile = BrowserProfile {
             name: "Custom-Unknown-Browser",
             user_agent: "some-ua",
@@ -285,25 +287,26 @@ mod tests {
             viewport_height: 720,
         };
         assert_eq!(
-            pick_emulation_for_profile(&profile),
-            Emulation::Chrome131,
-            "unknown profile should fall back to Chrome 131"
+            BrowserEmulation::from_profile(&profile),
+            BrowserEmulation::Chrome137,
+            "unknown profile should fall back to Chrome 137 (post-v0.4.3 default)"
         );
     }
 
     #[test]
-    fn browser_emulation_from_profile_maps_chrome_android_to_chrome131() {
-        // wreq-util 2 does not ship a dedicated mobile Chrome variant
-        // (its "FirefoxAndroid135" is Firefox-only), so we send Android
-        // traffic as desktop Chrome 131 and rely on the rest of the
-        // request (UA, viewport) to carry the mobile signal.
+    fn browser_emulation_from_profile_maps_chrome_android_to_chrome137() {
+        // Bug-fix v0.4.3: Chrome-Android now also maps to Chrome137
+        // (was Chrome131) for the same cf_clearance-compat reason as
+        // desktop Chrome profiles. wreq-util 2 does not ship a dedicated
+        // mobile Chrome variant, so we still send Android traffic as
+        // desktop Chrome 137 and rely on UA + viewport for the mobile signal.
         let profile = BROWSER_PROFILES
             .iter()
             .find(|p| p.name == "Chrome-Android")
             .expect("Chrome-Android profile missing from static table");
         assert_eq!(
             BrowserEmulation::from_profile(profile),
-            BrowserEmulation::Chrome131
+            BrowserEmulation::Chrome137
         );
     }
 
