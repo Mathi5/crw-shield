@@ -816,8 +816,41 @@ pub struct HitlSolveUiForm {
     pub cookies: String,
 }
 
-pub async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok","version": env!("CARGO_PKG_VERSION")}))
+pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    // Bug-fix v0.4.3: expose the cookie persistence status in /health so
+    // operators can confirm at a glance whether cookies survive a server
+    // restart. We return:
+    //   - "configured:<path>" when the configured path was writable
+    //   - "fallback:<path>" when the configured path was unwritable and
+    //     we fell back to the user-local dir (the existing WARN log
+    //     points at both paths so the operator can correlate)
+    //   - "disabled" when COOKIE_PERSISTENCE_PATH is empty / unset
+    //
+    // We intentionally do NOT include the raw path bytes here in case the
+    // server is behind a proxy that exposes /health unauthenticated —
+    // leaking the on-disk layout is a small but real info-disclosure. The
+    // status enum + server logs are enough to diagnose the fallback case.
+    let persistence_status = match &state.cookie_persistence_path {
+        Some(path) => {
+            let configured = state
+                .config
+                .cookie_persistence_path
+                .as_deref()
+                .map(std::path::Path::new);
+            let is_fallback = configured.is_some_and(|c| c != path);
+            if is_fallback {
+                "fallback"
+            } else {
+                "configured"
+            }
+        }
+        None => "disabled",
+    };
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "cookie_persistence": persistence_status,
+    }))
 }
 
 pub async fn scrape(

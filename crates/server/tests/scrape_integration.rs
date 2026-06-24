@@ -77,6 +77,21 @@ async fn health_endpoint_returns_ok() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
+    // Bug-fix v0.4.3: /health now exposes the cookie persistence status
+    // so operators can confirm at a glance whether cookies survive a
+    // server restart. With the default Config, persistence is enabled
+    // (default cookie_persistence_path is Some("/var/lib/crw-shield/...")).
+    // On CI / dev boxes that path is unwritable so the resolver falls
+    // back — we accept either "configured" or "fallback" here.
+    assert!(
+        body.get("cookie_persistence").is_some(),
+        "v0.4.3 /health must include cookie_persistence field, got: {body}"
+    );
+    let status = body["cookie_persistence"].as_str().unwrap_or("");
+    assert!(
+        matches!(status, "configured" | "fallback" | "disabled"),
+        "cookie_persistence must be one of configured|fallback|disabled, got: {status}"
+    );
 }
 
 #[tokio::test]

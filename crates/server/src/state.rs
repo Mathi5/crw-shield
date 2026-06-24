@@ -169,6 +169,16 @@ impl AppState {
         };
         let path = std::path::PathBuf::from(p);
         if Self::probe_writable(&path) {
+            // Bug-fix v0.4.3: log INFO (not WARN) when the configured path
+            // IS writable so operators can confirm at startup that the
+            // server is using the path they asked for. Previously this was
+            // silent, which made the WARN-on-fallback look like a
+            // surprise. See fix discussion in PITFALLS.md / cookie
+            // persistence.
+            tracing::info!(
+                path = %path.display(),
+                "cookie persistence enabled at configured path"
+            );
             return Some(path);
         }
         tracing::warn!(

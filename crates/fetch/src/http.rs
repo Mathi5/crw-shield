@@ -90,11 +90,19 @@ impl HttpFetcher {
     ) -> Result<Self> {
         #[cfg(feature = "tls-fingerprint")]
         let client = {
-            // Pick the Chrome 131 emulation for the default fetcher: the
-            // vast majority of real-world traffic looks like Chrome on
-            // Windows, and `wreq_util::Chrome131` ships the byte-perfect
-            // cipher suite order + extensions we need.
-            let client = build_wreq_client(wreq_util::Emulation::Chrome131, timeout_ms)?;
+            // Bug-fix v0.4.3: Chrome 137 emulation (was Chrome 131). The
+            // Chrome MCP bridge used for HITL solves runs Chrome 149, and
+            // Cloudflare's `cf_clearance` is bound to the TLS
+            // ClientHello + H2 SETTINGS of the browser that resolved the
+            // challenge. Chrome 131 was too far behind — the wreq
+            // fingerprint was rejected and HITL solve round-trips failed
+            // 100% of the time. Chrome 137 is the newest emulation in
+            // wreq-util 2.2.6 and the closest match available without
+            // bumping the major version. Operators can override at
+            // runtime via `CRW_TLS_EMULATION` (parsed in
+            // `tls_profile::pick_emulation_for_profile`).
+            let emulation = crate::tls_profile::pick_emulation_for_profile_or_env();
+            let client = build_wreq_client(emulation, timeout_ms)?;
             HttpClient::wreq(client)
         };
         #[cfg(not(feature = "tls-fingerprint"))]

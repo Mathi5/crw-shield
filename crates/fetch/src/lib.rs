@@ -14,5 +14,8 @@ pub use ladder::{
     LadderResult,
 };
 #[cfg(feature = "tls-fingerprint")]
-pub use tls_profile::{build_wreq_client, pick_emulation_for_profile, BrowserEmulation};
+pub use tls_profile::{
+    build_wreq_client, pick_emulation_for_profile, pick_emulation_for_profile_or_env,
+    BrowserEmulation,
+};
 pub use tls_proxy::{TlsProxy, TlsProxyConfig};
