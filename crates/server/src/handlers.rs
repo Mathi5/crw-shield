@@ -312,6 +312,17 @@ async fn handle_hitl_solve(
                           "cookie jar snapshot saved after HITL solve");
                 }
             }
+            // Bug-fix v0.4.2: stamp the host as "freshly HITL-solved" so
+            // the L1 ClearAndRetry step in the fetch ladder does NOT wipe
+            // these just-injected cookies on the next scrape. The window
+            // is 1 hour (`HITL_PROTECT_WINDOW_SECS`). Without this stamp
+            // the next scrape returns the same challenge, L1 clears the
+            // cookies we just saved, and HITL re-triggers immediately.
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            shared_jar.mark_hitl_solved(&resolved_host, now_unix);
             // Mutate the queue entry to mark solved.
             let mut new_entry = entry.clone();
             if let Some(obj) = new_entry.as_object_mut() {

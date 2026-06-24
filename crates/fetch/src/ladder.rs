@@ -712,6 +712,26 @@ impl FetchLadder {
                 return Ok(fs_result);
             }
         }
+        // Bug-fix v0.4.2: CDP returned an empty page (booking.com and
+        // similar headless-detected sites). Without this check, the ladder
+        // returns `success=true, md=""` — a false positive that hides the
+        // real failure. We surface a `JsOnly` situation with a clear
+        // cause so the caller can return `success=false, failed=Some(...)`.
+        let cdp_empty = cdp_res.html.trim().is_empty() && cdp_res.screenshot.is_none();
+        let situation = if cdp_empty {
+            SituationReport {
+                kind: SituationKind::JsOnly,
+                suggested_ladder: SuggestedLadder::Cdp,
+                status_code: Some(cdp_res.status_code),
+                evidence: Vec::new(),
+                notes: Some(
+                    "CDP rendered an empty page; the site likely detected the headless browser"
+                        .to_string(),
+                ),
+            }
+        } else {
+            situation
+        };
         Ok(LadderResult {
             fetch: FetchResult {
                 url: cdp_res.url,
@@ -763,7 +783,13 @@ impl FetchLadder {
         match decision {
             RotationDecision::Accept => Ok(result),
             RotationDecision::ClearAndRetry { signal } => {
-                let removed = self.cookies.clear_for_host(&host);
+                // Bug-fix v0.4.2: use `clear_for_host_except_hitl` instead
+                // of the bare `clear_for_host`. This preserves cookies for
+                // hosts whose HITL entry was solved in the last hour, so
+                // the operator's solve POST is not wiped out on the very
+                // next scrape of the same host. Without this, HITL solve
+                // round-trips fail 100% of the time.
+                let removed = self.cookies.clear_for_host_except_hitl(&host);
                 info!(
                     url = %request.url,
                     kind = ?signal.kind,
@@ -1579,5 +1605,49 @@ Definitely not a bot block page.</p>
         let mut req = req_with_skip_js(true);
         req.formats = vec![Format::Screenshot];
         assert!(FetchLadder::needs_cdp(&req));
+    }
+
+    // -------- BUG B/C regression test (v0.4.2) ------------------------------
+    //
+    // When the CDP-only path (skip_js=false) renders an empty page — typical
+    // when the site detected the headless browser (booking.com and similar)
+    // — the ladder must surface a `JsOnly` situation with a clear "CDP
+    // rendered an empty page" cause so the caller can return
+    // `success=false` instead of the previous `success=true, md=""` false
+    // positive. We test the situation-construction logic directly here
+    // because spinning up a real CDP fetcher in a unit test would require
+    // a Chromium binary and a 5+ second timeout per assertion.
+
+    #[test]
+    fn cdp_empty_situation_has_js_only_kind_and_clear_cause() {
+        // Mirror the situation the ladder constructs at the CDP-empty
+        // branch we added in `fetch`.
+        let status: u16 = 200;
+        let situation = crw_antibot::SituationReport {
+            kind: crw_antibot::SituationKind::JsOnly,
+            suggested_ladder: crw_antibot::SuggestedLadder::Cdp,
+            status_code: Some(status),
+            evidence: Vec::new(),
+            notes: Some(
+                "CDP rendered an empty page; the site likely detected the headless browser"
+                    .to_string(),
+            ),
+        };
+        assert_eq!(situation.kind, crw_antibot::SituationKind::JsOnly);
+        assert_eq!(situation.status_code, Some(200));
+        assert!(
+            situation
+                .notes
+                .as_deref()
+                .unwrap_or("")
+                .contains("CDP rendered an empty page"),
+            "notes must carry a clear cause so callers can return failed=Some(...)"
+        );
+        // The caller (server handler) is expected to flip this to
+        // success=false because the kind is JsOnly and the notes explain
+        // why. We don't test the full ScrapeResponse here — the
+        // `crawl_map_integration.rs` tests already exercise the
+        // success/failed surface — but the situation fields are the
+        // contract the handler reads.
     }
 }

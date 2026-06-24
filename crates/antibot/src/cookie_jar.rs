@@ -40,6 +40,14 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// How long, after a HITL solve, the cookie jar treats that host as
+/// "freshly solved" and refuses to drop its cookies during an L1
+/// ClearAndRetry. 1 hour is a generous window — the solve cookies are
+/// typically valid for at least 15-30 minutes, and the operator rarely
+/// re-solves a host within the same hour. Anything older than that and
+/// the host is treated like any other.
+const HITL_PROTECT_WINDOW_SECS: u64 = 3600;
+
 /// Error type for cookie-jar persistence (save/load).
 #[derive(Debug)]
 pub struct CookieJarError(pub String);
@@ -70,6 +78,18 @@ pub struct Entry {
 struct Inner {
     /// `host -> (cookie name -> entry)`
     cookies: HashMap<String, HashMap<String, Entry>>,
+    /// `host -> last Unix epoch seconds the host was HITL-solved`.
+    ///
+    /// Tracks per-host "last HITL solve timestamp" so the L1 ClearAndRetry
+    /// step in the fetch ladder can skip hosts that were just solved
+    /// manually. Without this, the operator's HITL solve POST injects
+    /// cookies → the next scrape of that host returns the same anti-bot
+    /// challenge → L1 immediately clears the cookies we just injected →
+    /// HITL re-triggers forever. The server's HITL solve handler calls
+    /// [`CookieJar::mark_hitl_solved`] to stamp the host here, and the
+    /// ladder calls [`CookieJar::clear_for_host_except_hitl`] instead of
+    /// the bare `clear_for_host` so cookies for protected hosts survive.
+    last_hitl_solved_unix: HashMap<String, u64>,
 }
 
 /// Thread-safe cookie jar keyed by host.
@@ -164,6 +184,81 @@ impl CookieJar {
         let mut guard = self.inner.lock().expect("cookie jar mutex poisoned");
         let mut removed = 0usize;
         for h in host_candidates(&normalized) {
+            if let Some(bucket) = guard.cookies.get_mut(&h) {
+                removed += bucket.len();
+                bucket.clear();
+            }
+        }
+        // Also remove now-empty buckets from the outer map.
+        guard.cookies.retain(|_, bucket| !bucket.is_empty());
+        removed
+    }
+
+    /// Stamp `host` as having been HITL-solved at `timestamp_unix`.
+    ///
+    /// Called by the server's HITL solve handler immediately after it
+    /// injects the operator-supplied cookies into the shared jar. The
+    /// stamp is what tells the L1 ClearAndRetry step in the fetch ladder
+    /// to *keep* those cookies instead of dropping them on the next
+    /// scrape of the same host.
+    ///
+    /// Pass `timestamp_unix` as Unix epoch seconds; pass `unix_now()`
+    /// (or `SystemTime::now()`) for "now". The stamp is per-host, and
+    /// parent-domain candidates are NOT propagated — only the exact host
+    /// (and any host-aliases the caller also stamps) is protected.
+    pub fn mark_hitl_solved(&self, host: &str, timestamp_unix: u64) {
+        let normalized = normalize_host(host);
+        let mut guard = self.inner.lock().expect("cookie jar mutex poisoned");
+        guard
+            .last_hitl_solved_unix
+            .insert(normalized, timestamp_unix);
+    }
+
+    /// Return the last HITL-solve timestamp for `host`, if any.
+    #[cfg(test)]
+    pub fn last_hitl_solved_unix(&self, host: &str) -> Option<u64> {
+        let normalized = normalize_host(host);
+        let guard = self.inner.lock().expect("cookie jar mutex poisoned");
+        guard.last_hitl_solved_unix.get(&normalized).copied()
+    }
+
+    /// Variant of [`Self::clear_for_host`] that **preserves** cookies for
+    /// hosts whose HITL-solve timestamp is within the last hour
+    /// ([`HITL_PROTECT_WINDOW_SECS`]).
+    ///
+    /// This is what the fetch ladder's L1 ClearAndRetry step should call
+    /// instead of the bare `clear_for_host`: without it, the operator's
+    /// HITL solve POST injects cookies into the jar, the very next
+    /// scrape of that host returns the same anti-bot block (because
+    /// challenge cookies take a moment to take effect), L1 immediately
+    /// clears the just-injected cookies, and HITL re-triggers on every
+    /// subsequent scrape until the operator gives up.
+    ///
+    /// Returns the number of cookies actually removed. Cookies belonging
+    /// to a host whose `last_hitl_solved_unix` is within the protect
+    /// window are counted in `kept_hosts` (telemetry) but are NOT
+    /// removed.
+    ///
+    /// Use [`Self::mark_hitl_solved`] to stamp the host before the next
+    /// scrape cycle. The window is intentionally short (1h) so a
+    /// long-stale HITL cookie still gets a chance to be cleaned up.
+    pub fn clear_for_host_except_hitl(&self, host: &str) -> usize {
+        let normalized = normalize_host(host);
+        let mut guard = self.inner.lock().expect("cookie jar mutex poisoned");
+        let now = unix_now().unwrap_or(0);
+        let mut removed = 0usize;
+        for h in host_candidates(&normalized) {
+            // Skip hosts that were HITL-solved within the protect window.
+            // We check the timestamp first, BEFORE deciding to drop, so
+            // a never-solved host is still cleared.
+            let protected = guard
+                .last_hitl_solved_unix
+                .get(&h)
+                .copied()
+                .is_some_and(|t| now.saturating_sub(t) < HITL_PROTECT_WINDOW_SECS);
+            if protected {
+                continue;
+            }
             if let Some(bucket) = guard.cookies.get_mut(&h) {
                 removed += bucket.len();
                 bucket.clear();
@@ -392,7 +487,10 @@ impl CookieJar {
         }
 
         Ok(Self {
-            inner: Mutex::new(Inner { cookies }),
+            inner: Mutex::new(Inner {
+                cookies,
+                last_hitl_solved_unix: HashMap::new(),
+            }),
         })
     }
 }
@@ -707,5 +805,73 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -------- BUG A regression tests (v0.4.2) -------------------------------
+    //
+    // The L1 ClearAndRetry step in the fetch ladder used to call the bare
+    // `clear_for_host`, which wiped out cookies the operator just injected
+    // via the HITL solve endpoint. The fix introduces a
+    // `last_hitl_solved_unix` stamp per host, and a new
+    // `clear_for_host_except_hitl` that preserves cookies for hosts
+    // stamped within the last hour.
+
+    #[test]
+    fn clear_for_host_except_hitl_preserves_recently_solved_host() {
+        // Set cookies on two hosts, mark only one as HITL-solved.
+        let jar = CookieJar::new();
+        jar.set_cookie("protected.example", "cf_clearance", "abc123", None);
+        jar.set_cookie("scratch.example", "session", "xyz", None);
+        let now = unix_now().unwrap_or(0);
+        jar.mark_hitl_solved("protected.example", now);
+
+        // Clear "scratch.example" first — only its cookie should go.
+        let removed = jar.clear_for_host_except_hitl("scratch.example");
+        assert_eq!(removed, 1, "exactly one cookie removed from scratch host");
+        assert!(jar
+            .cookie_header_for("https://protected.example/")
+            .is_some());
+
+        // Now clear "protected.example" — the HITL stamp is fresh so
+        // the cookies must SURVIVE this call.
+        let removed = jar.clear_for_host_except_hitl("protected.example");
+        assert_eq!(
+            removed, 0,
+            "HITL-protected host must NOT lose its cookies within the window"
+        );
+        let header = jar
+            .cookie_header_for("https://protected.example/")
+            .expect("protected cookie survives");
+        assert_eq!(header, "cf_clearance=abc123");
+    }
+
+    #[test]
+    fn clear_for_host_except_hitl_drops_cookies_after_window_expires() {
+        // Stamp the host with a timestamp far in the past so the protect
+        // window is already expired.
+        let jar = CookieJar::new();
+        jar.set_cookie("stale.example", "cf_clearance", "abc", None);
+        let long_ago = unix_now().unwrap_or(0).saturating_sub(2 * 3600);
+        jar.mark_hitl_solved("stale.example", long_ago);
+
+        let removed = jar.clear_for_host_except_hitl("stale.example");
+        assert_eq!(
+            removed, 1,
+            "cookies older than the protect window must be cleared like normal"
+        );
+        assert!(jar.cookie_header_for("https://stale.example/").is_none());
+    }
+
+    #[test]
+    fn clear_for_host_except_hitl_clears_normal_host_immediately() {
+        // A host that was never HITL-solved must behave identically to
+        // the bare `clear_for_host` — clear right away.
+        let jar = CookieJar::new();
+        jar.set_cookie("normal.example", "session", "xyz", None);
+        let removed = jar.clear_for_host_except_hitl("normal.example");
+        assert_eq!(removed, 1);
+        assert!(jar.cookie_header_for("https://normal.example/").is_none());
+        // last_hitl_solved_unix must remain None (we never stamped it).
+        assert!(jar.last_hitl_solved_unix("normal.example").is_none());
     }
 }

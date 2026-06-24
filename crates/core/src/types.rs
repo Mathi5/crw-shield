@@ -561,6 +561,14 @@ pub struct SearchResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ErrorResponse {
     pub success: bool,
+    /// Stable machine-readable error code (e.g. `"INVALID_URL"`,
+    /// `"HITL_REQUIRED"`, `"FETCH_ERROR"`). Bug-fix v0.4.2: previously
+    /// the field could be set to an empty string by callers that built
+    /// `json!({"success": false, "error": ""})` inline, which made
+    /// debugging impossible (the JSON would serialise as
+    /// `"error": ""`). `#[serde(default)]` keeps the field present in
+    /// the wire format even when constructed by 3rd-party code.
+    #[serde(default)]
     pub error: String,
     pub message: String,
     #[serde(default)]
@@ -568,11 +576,24 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
+    /// Build a new error response. Both `code` and `message` are
+    /// required — empty strings are replaced with `"unspecified"` so
+    /// the wire JSON always carries a useful diagnostic.
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        let code = code.into();
+        let message = message.into();
         Self {
             success: false,
-            error: code.into(),
-            message: message.into(),
+            error: if code.trim().is_empty() {
+                "unspecified".to_string()
+            } else {
+                code
+            },
+            message: if message.trim().is_empty() {
+                "unspecified error".to_string()
+            } else {
+                message
+            },
             details: None,
         }
     }
@@ -785,5 +806,47 @@ mod tests {
         assert_eq!(actions.len(), 2);
         matches!(actions[0], BrowserAction::Wait { .. });
         matches!(actions[1], BrowserAction::Click { .. });
+    }
+
+    // -------- BUG E regression test (v0.4.2) --------------------------------
+    //
+    // Previously a caller could build `ErrorResponse::new("", "")` (or any
+    // inline `json!({"success": false})` without an `error` field) and
+    // serialise an error response with empty / missing fields — the
+    // benchmark flagged one such file with `success=false` but
+    // `error=None`. The fix: `ErrorResponse::new` now replaces empty
+    // `code` / `message` with `"unspecified"` / `"unspecified error"`,
+    // and `#[serde(default)]` on the `error` field keeps it present in
+    // the wire JSON even when constructed by 3rd-party code.
+
+    #[test]
+    fn error_response_falls_back_to_unspecified_when_empty() {
+        let e = ErrorResponse::new("", "");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["success"], serde_json::json!(false));
+        // The fix: empty code/message must NOT serialise as "" — that's
+        // the failure mode the benchmark caught (`failed:None`).
+        assert_eq!(
+            v["error"], "unspecified",
+            "empty code must fall back to 'unspecified'"
+        );
+        assert_eq!(
+            v["message"], "unspecified error",
+            "empty message must fall back to 'unspecified error'"
+        );
+        // The `error` field must always be present (no missing key).
+        assert!(v.get("error").is_some());
+    }
+
+    #[test]
+    fn error_response_deserializes_missing_error_field_as_empty_string() {
+        // Bug-fix v0.4.2: with `#[serde(default)]` on `error`, a JSON
+        // payload without the `error` key (e.g. produced by an older
+        // binary) deserialises cleanly into an empty string, not an
+        // Err. This is what makes the wire format forgiving.
+        let payload = r#"{"success":false,"message":"oops"}"#;
+        let e: ErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(e.error, "");
+        assert_eq!(e.message, "oops");
     }
 }

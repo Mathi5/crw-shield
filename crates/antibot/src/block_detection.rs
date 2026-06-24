@@ -32,6 +32,13 @@ pub const BLOCK_THRESHOLD: f32 = 0.7;
 /// threshold — see `docs/known-limitations.md` in cortex-bridge.
 pub const EMPTY_THRESHOLD_BYTES: usize = 600;
 
+/// How many occurrences of "sign in" / "log in" a body must contain
+/// before we flag it as a login wall without matching one of the
+/// explicit LoginWall patterns. 3 catches the common case of nav +
+/// form + footer all repeating the phrase, while staying clear of
+/// articles that legitimately mention "sign in" once or twice.
+const LOGIN_WALL_SIGN_IN_THRESHOLD: usize = 3;
+
 /// Which anti-bot system we're pretty sure served the block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockKind {
@@ -43,10 +50,15 @@ pub enum BlockKind {
     Datadome,
     /// `/_sec/verify?provider=interstitial`, `awswaf-token`
     AwsWaf,
-    /// "captcha", "verify you are human", "I am human"
+    /// Generic captcha
     GenericCaptcha,
     /// 200 OK but page is suspiciously tiny
     Empty,
+    /// Login wall — page renders a "Sign in" gate (twitter.com,
+    /// linkedin.com, ...) instead of the requested content. Not a
+    /// captcha/anti-bot challenge — the user needs to provide
+    /// credentials, not solve a puzzle.
+    LoginWall,
 }
 
 /// Detection result with a confidence level.
@@ -174,6 +186,48 @@ const PATTERNS: &[Pattern] = &[
         body_weight: 0.5,
         phrase: "I am human",
     },
+    // Login wall — the page renders a "Sign in" / "Log in" gate instead
+    // of the content the user asked for (twitter.com, linkedin.com,
+    // instagram.com, ...). Bug-fix v0.4.2: these used to be returned as
+    // `success=true` with the navigation extracted as markdown, which
+    // looks like a successful scrape to the caller but contains zero
+    // useful content.
+    Pattern {
+        kind: BlockKind::LoginWall,
+        title_weight: 0.7,
+        body_weight: 0.5,
+        phrase: "Sign in or Sign up",
+    },
+    Pattern {
+        kind: BlockKind::LoginWall,
+        title_weight: 0.6,
+        body_weight: 0.5,
+        phrase: "Log in to continue",
+    },
+    Pattern {
+        kind: BlockKind::LoginWall,
+        title_weight: 0.6,
+        body_weight: 0.4,
+        phrase: "Continue with Google",
+    },
+    Pattern {
+        kind: BlockKind::LoginWall,
+        title_weight: 0.0,
+        body_weight: 0.7,
+        phrase: "authwall",
+    },
+    Pattern {
+        kind: BlockKind::LoginWall,
+        title_weight: 0.5,
+        body_weight: 0.5,
+        phrase: "Sign in to your account",
+    },
+    Pattern {
+        kind: BlockKind::LoginWall,
+        title_weight: 0.5,
+        body_weight: 0.5,
+        phrase: "Log in or Sign up",
+    },
 ];
 
 /// Run the block-detection pass over an HTML response + its extracted title.
@@ -232,6 +286,30 @@ pub fn detect(html: &str, title: &str) -> Option<BlockSignal> {
                 EMPTY_THRESHOLD_BYTES
             ),
         });
+    }
+
+    // Bug-fix v0.4.2: login-wall heuristic. Many login walls don't match
+    // a single specific phrase but DO repeat "Sign in" / "Log in" many
+    // times across nav + form + footer. If the page mentions "sign in"
+    // (or close variants) more than `LOGIN_WALL_SIGN_IN_THRESHOLD` times,
+    // flag as LoginWall even if no single pattern triggered.
+    if !matches!(
+        best,
+        Some(BlockSignal {
+            kind: BlockKind::LoginWall,
+            ..
+        })
+    ) {
+        let sign_in_count = html_lc.matches("sign in").count() + html_lc.matches("log in").count();
+        if sign_in_count >= LOGIN_WALL_SIGN_IN_THRESHOLD {
+            best = Some(BlockSignal {
+                kind: BlockKind::LoginWall,
+                confidence: 0.6,
+                matched: format!(
+                    "found {sign_in_count} occurrences of 'sign in' / 'log in' (threshold {LOGIN_WALL_SIGN_IN_THRESHOLD})"
+                ),
+            });
+        }
     }
 
     best
@@ -385,5 +463,56 @@ mod tests {
         c.record_rotation();
         assert_eq!(c.rotations(), 2);
         assert!(c.ms_since_last_rotation().is_some());
+    }
+
+    // -------- BUG D regression tests (v0.4.2) -------------------------------
+    //
+    // Login-wall pages (twitter.com, linkedin.com, ...) used to be returned
+    // as `success=true` with the navigation extracted as markdown. The fix
+    // adds a `BlockKind::LoginWall` variant and 6 phrase patterns, plus a
+    // fallback heuristic that flags bodies repeating "sign in" / "log in"
+    // more than 3 times.
+
+    #[test]
+    fn login_wall_detected_by_sign_in_or_sign_up_pattern() {
+        let html = r#"<!doctype html><html><head><title>Sign in or Sign up</title></head>
+            <body><h1>Sign in or Sign up to X</h1><p>Welcome.</p></body></html>"#;
+        let sig = detect(html, "Sign in or Sign up - X").expect("login wall should be detected");
+        assert_eq!(sig.kind, BlockKind::LoginWall);
+        assert!(sig.confidence >= BLOCK_THRESHOLD);
+    }
+
+    #[test]
+    fn login_wall_detected_by_repeated_sign_in_phrase() {
+        // No explicit "Sign in or Sign up" pattern match, but the body
+        // repeats "Sign in" across nav, form, and footer — the
+        // heuristic should catch it.
+        let html = r#"<!doctype html><html><head><title>Home</title></head>
+            <body>
+            <nav><a>Sign in</a></nav>
+            <form><button>Sign in</button></form>
+            <footer><a>Sign in</a> | <a>Log in</a></footer>
+            </body></html>"#;
+        let sig = detect(html, "Home").expect("login wall heuristic should fire");
+        assert_eq!(sig.kind, BlockKind::LoginWall);
+    }
+
+    #[test]
+    fn real_article_not_detected_as_login_wall() {
+        let html = r#"<!doctype html><html><head><title>Article</title></head>
+            <body><article><h1>Lorem ipsum dolor sit amet</h1>
+            <p>Consectetur adipiscing elit, sed do eiusmod tempor incididunt
+            ut labore et dolore magna aliqua. Ut enim ad minim veniam.</p>
+            </article></body></html>"#;
+        let sig = detect(html, "Article");
+        // Either None or a non-LoginWall signal is acceptable — the key
+        // is we don't false-positive on real content.
+        if let Some(s) = sig {
+            assert_ne!(
+                s.kind,
+                BlockKind::LoginWall,
+                "real article body must not be flagged as login wall"
+            );
+        }
     }
 }
