@@ -32,6 +32,13 @@ chrono = { workspace = true }
 base64 = { workspace = true }
 anyhow = "1"
 reqwest = { workspace = true }
+# WebSocket client for the headed HITL viewer CDP proxy (v0.4.6).
+# Matches the version used by chromiumoxide 0.9 for consistency.
+async-tungstenite = { version = "0.32", features = ["tokio-runtime"] }
+# Direct dependency on futures-util to disambiguate StreamExt impls
+# between axum's WebSocket and async-tungstenite's WebSocketStream
+# (both impl futures::Stream; the explicit name avoids conflicts).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 mockito = { workspace = true }

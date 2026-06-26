@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use crw_antibot::{DelayPreset, HostCounters};
 use crw_core::Config;
 use crw_fetch::{
-    CdpConfig, CdpFetcher, FetchLadder, FlareSolverrAllowlist, FlareSolverrClient, HttpFetcher,
-    TlsProxy,
+    new_session_registry, CdpConfig, CdpFetcher, FetchLadder, FlareSolverrAllowlist,
+    FlareSolverrClient, HttpFetcher, SessionRegistry, TlsProxy,
 };
 
 use crate::handlers::CrawlJob;
@@ -39,6 +39,11 @@ pub struct AppState {
     /// in-memory only. Handlers should read this rather than
     /// `config.cookie_persistence_path` so they pick up the fallback.
     pub cookie_persistence_path: Option<std::path::PathBuf>,
+    /// Active headed HITL sessions, keyed by hitl_id. Created lazily
+    /// when a `POST /v2/scrape?wait_for_human=true` escalates to L3.
+    /// The viewer endpoint (`/hitl/viewer/{id}`) and the CDP proxy
+    /// endpoint (`/hitl/cdp/{id}`) look up sessions here.
+    pub hitl_sessions: SessionRegistry,
 }
 
 impl AppState {
@@ -142,6 +147,7 @@ impl AppState {
             tls_proxy,
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_env()),
             cookie_persistence_path: cookie_path,
+            hitl_sessions: new_session_registry(),
         }
     }
 
@@ -381,6 +387,7 @@ impl AppState {
             tls_proxy: None,
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_env()),
             cookie_persistence_path: cookie_path,
+            hitl_sessions: new_session_registry(),
         }
     }
 }
