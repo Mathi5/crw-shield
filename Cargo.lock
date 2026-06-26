@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "crw-antibot"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "once_cell",
  "rand 0.8.6",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "crw-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "crw-crawl"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "crw-core",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "crw-extract"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "crw-antibot",
  "crw-core",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "crw-fetch"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "crw-map"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "crw-core",
  "crw-extract",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "crw-search"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "crw-core",
  "mockito",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "crw-server"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
